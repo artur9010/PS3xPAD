@@ -233,11 +233,20 @@ static void outu(char **dst, size_t *left, int *len, unsigned int v, unsigned in
 int snprintf(char *str, size_t size, const char *fmt, ...)
 {
     va_list ap;
+    int rv;
+    va_start(ap, fmt);
+    rv = vsnprintf(str, size, fmt, ap);
+    va_end(ap);
+    return rv;
+}
+
+static int
+_vsnprintf_inner(char *str, size_t size, const char *fmt, va_list ap)
+{
     char *dst = str;
     size_t left = size;
     int len = 0;
 
-    va_start(ap, fmt);
     while (*fmt) {
         if (*fmt != '%') {
             outc(&dst, &left, &len, *fmt++);
@@ -259,9 +268,31 @@ int snprintf(char *str, size_t size, const char *fmt, ...)
             outu(&dst, &left, &len, (unsigned int)v, 10, 0, 0);
             break;
         }
+        case 'u':
+            outu(&dst, &left, &len, va_arg(ap, unsigned int), 10, 0, 0);
+            break;
         case 'x':
             outu(&dst, &left, &len, va_arg(ap, unsigned int), 16, 4, 1);
             break;
+        case 'l': {
+            if (*fmt == 'l') { fmt++; }
+            if (*fmt == 'u') {
+                outu(&dst, &left, &len, va_arg(ap, unsigned long long), 10, 0, 0);
+                fmt++;
+            } else if (*fmt == 'x') {
+                outu(&dst, &left, &len, va_arg(ap, unsigned long long), 16, 0, 0);
+                fmt++;
+            } else if (*fmt == 'd') {
+                long long v = va_arg(ap, long long);
+                if (v < 0) {
+                    outc(&dst, &left, &len, '-');
+                    v = -v;
+                }
+                outu(&dst, &left, &len, (unsigned long long)v, 10, 0, 0);
+                fmt++;
+            }
+            break;
+        }
         case '%':
             outc(&dst, &left, &len, '%');
             break;
@@ -270,4 +301,9 @@ int snprintf(char *str, size_t size, const char *fmt, ...)
     va_end(ap);
     if (size) *dst = 0;
     return len;
+}
+
+int vsnprintf(char *str, size_t size, const char *fmt, va_list ap)
+{
+    return _vsnprintf_inner(str, size, fmt, ap);
 }

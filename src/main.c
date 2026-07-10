@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 #ifdef USE_PSL1GHT
 #include "psl1ght_compat.h"
@@ -15,6 +16,7 @@
 #include <cell/pad.h>
 #include <cell/pad/libpad_dbg.h>
 #include <cell/usbd.h>
+#include <cell/fs/cell_fs_file_api.h>
 #endif
 #include "ControlStruct.h"
 
@@ -32,6 +34,18 @@
 #define RINGBUF_SIZE  10
 #define DESCRIPTOR_TABLE_SIZE (sizeof(descriptor_table)/sizeof(descriptor_table_t))
 #define SWAP16(x) ((uint16_t)((((x) & 0x00FF) << 8) | (((x) & 0xFF00) >> 8)))
+
+// LV2 address of device_type[0] in the pad manager struct.
+// Set to 0 to disable the LV2 poke (device_type stays as LDD=5).
+// To find: load plugin with DualSense connected, use webMAN MOD's /find.lv2 to locate
+// the device_type array, then hardcode the address here.
+// 4.93 CEX EvilNat: LV2_OFFSET_ON_LV1 = 0x8000000.
+#define DEVICE_TYPE_ARRAY_ADDR 0x0  // 0 = use runtime scanner; non-zero = hardcoded
+
+// LV2 scan range for runtime scanner. LV2 kernel data typically in first 16-32MB.
+#define DEVICE_TYPE_SCAN_START 0x100000ULL
+#define DEVICE_TYPE_SCAN_END   0x2000000ULL  // 32MB
+#define DEVICE_TYPE_SCAN_STEP  0x100ULL      // 256-byte stride
 
 enum XTYPES {
   XTYPE_XBOX360 = 1,
@@ -228,14 +242,112 @@ static inline void _sys_ppu_thread_exit(uint64_t val) {
 }
 
 static inline sys_prx_id_t prx_get_module_id_by_address(void *addr) {
-  system_call_1(461, (uint64_t)(uint32_t)addr);
-  return((int)p1);
+  register uint64_t p1 asm("3") = (uint64_t)(uint32_t)addr;
+  register uint64_t scn asm("11") = 461;
+  __asm__ __volatile__("sc"
+                       : "+r"(p1)
+                       :
+                       : "r0","r12","lr","ctr","xer","cr0","cr1","cr5","cr6","cr7","memory");
+  return (sys_prx_id_t)p1;
 }
 
 static inline void sys_pad_dbg_ldd_register_controller(uint8_t *data, int32_t *handle, uint8_t addr, uint32_t capability) {
 
   // syscall for registering a virtual controller with custom capabilities
   system_call_4(574, (uint8_t *)data, (int32_t *)handle, (uint8_t)addr, (uint32_t)capability);
+}
+
+// LV2 peek via CFW syscall 8. Uses LV2_OFFSET_ON_LV1 = 0x8000000 (correct for 4.75-4.93 CEX).
+// Uses raw asm with explicit register capture to avoid lv2syscall macro scope issues.
+static inline uint64_t lv2_peek64(uint64_t lv2_addr) {
+  register uint64_t p1 asm("3") = lv2_addr + 0x8000000ULL;
+  register uint64_t scn asm("11") = 8;
+  __asm__ __volatile__("sc"
+                       : "+r"(p1)
+                       :
+                       : "r0","r12","lr","ctr","xer","cr0","cr1","cr5","cr6","cr7","memory");
+  return p1;
+}
+
+// LV2 poke via CFW syscall 9. Uses LV2_OFFSET_ON_LV1 = 0x8000000 (correct for 4.75-4.93 CEX).
+// Returns 0 on success, -1 if address is 0 (disabled).
+static inline int lv2_poke32(uint64_t lv2_addr, uint32_t value) {
+  if (lv2_addr == 0) return(-1);
+  register uint64_t p1 asm("3") = lv2_addr + 0x8000000ULL;
+  register uint64_t p2 asm("4") = (uint64_t)value;
+  register uint64_t scn asm("11") = 9;
+  __asm__ __volatile__("sc"
+                       : "+r"(p1)
+                       :
+                       : "r0","r12","lr","ctr","xer","cr0","cr1","cr5","cr6","cr7","memory");
+  return (int)p1;
+}
+
+// Scan LV2 memory for the device_type[7] array. Look for a sequence of 7 consecutive
+// u32 values where exactly ONE is non-zero (= 5, LDD type). Skip page at 0x7FFFF0
+// (false positive from BSS zeros).
+// Returns LV2 address if found, 0 if not found.
+static uint64_t find_device_type_array(void) {
+  uint64_t addr;
+  char dmsg[80];
+  uint32_t candidate_count = 0;
+
+  for (addr = DEVICE_TYPE_SCAN_START; addr < DEVICE_TYPE_SCAN_END; addr += DEVICE_TYPE_SCAN_STEP) {
+    uint64_t w0 = lv2_peek64(addr);
+    uint64_t w1 = lv2_peek64(addr + 8);
+    uint64_t w2 = lv2_peek64(addr + 16);
+    uint64_t w3 = lv2_peek64(addr + 24);
+
+    uint32_t v0 = (uint32_t)w0, v1 = (uint32_t)w1, v2 = (uint32_t)w2, v3 = (uint32_t)w3;
+    uint32_t h1 = (uint32_t)(w0 >> 32), h2 = (uint32_t)(w1 >> 32), h3 = (uint32_t)(w2 >> 32), h4 = (uint32_t)(w3 >> 32);
+
+    // Match device_type: v0=5 (LDD), all rest = 0
+    if (v0 == 5 && v1 == 0 && v2 == 0 && v3 == 0 &&
+        h1 == 0 && h2 == 0 && h3 == 0 && h4 == 0) {
+      // Verify it's part of the pad manager: device_type is at struct offset 96,
+      // so max_connect is at addr - 96. Check max_connect = 7 and
+      // now_connect should be >= 1 (at least one controller connected).
+      uint64_t prev96 = lv2_peek64(addr - 96);
+      uint32_t max_connect = (uint32_t)prev96;
+      uint32_t now_connect = (uint32_t)(prev96 >> 32);
+      candidate_count++;
+      if (candidate_count <= 5) {  // only log first few
+        snprintf(dmsg, sizeof(dmsg), "XPAD cand#%u at 0x%llx mc=%u nc=%u",
+                 candidate_count, (unsigned long long)addr, max_connect, now_connect);
+        show_msg(dmsg);
+      }
+      if (max_connect == 7 && now_connect >= 1) return(addr);
+    }
+  }
+  // No verified match; log how many candidates we saw
+  snprintf(dmsg, sizeof(dmsg), "XPAD scan1 done %u cands", candidate_count);
+  show_msg(dmsg);
+
+  // Fallback pattern: maybe device_type is stored as u8 array (7 bytes) instead of u32.
+  // Look for byte 0x05 followed by 6 zero bytes.
+  candidate_count = 0;
+  for (addr = DEVICE_TYPE_SCAN_START; addr < DEVICE_TYPE_SCAN_END; addr += DEVICE_TYPE_SCAN_STEP) {
+    uint64_t w0 = lv2_peek64(addr);
+    // First 7 bytes: 05 00 00 00 00 00 00, then arbitrary
+    uint8_t b0 = (uint8_t)(w0);
+    uint8_t b1 = (uint8_t)(w0 >> 8);
+    uint8_t b2 = (uint8_t)(w0 >> 16);
+    uint8_t b3 = (uint8_t)(w0 >> 24);
+    uint8_t b4 = (uint8_t)(w0 >> 32);
+    uint8_t b5 = (uint8_t)(w0 >> 40);
+    uint8_t b6 = (uint8_t)(w0 >> 48);
+    if (b0 == 5 && b1 == 0 && b2 == 0 && b3 == 0 && b4 == 0 && b5 == 0 && b6 == 0) {
+      candidate_count++;
+      if (candidate_count <= 3) {
+        snprintf(dmsg, sizeof(dmsg), "XPAD cand8#%u at 0x%llx", candidate_count, (unsigned long long)addr);
+        show_msg(dmsg);
+      }
+    }
+  }
+  snprintf(dmsg, sizeof(dmsg), "XPAD scan2 done %u cands", candidate_count);
+  show_msg(dmsg);
+
+  return(0);
 }
 
 static inline void sys_pad_dbg_ldd_set_data_insert_mode(int32_t handle, uint16_t addr, uint32_t *mode, uint8_t addr2) {
@@ -277,10 +389,35 @@ void *getNIDfunc(const char * vsh_module, uint32_t fnid, int32_t offset) {
   return(0);
 }
 
+// Append a debug message to /dev_hdd0/tmp/xpad_log.txt (for remote inspection).
+// Returns nothing; failures are silently ignored.
+static void log_msg(const char *fmt, ...) {
+  char buf[256];
+  va_list ap;
+  va_start(ap, fmt);
+  int len = vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  if (len < 0) return;
+  if (len >= (int)sizeof(buf)) len = sizeof(buf) - 1;
+
+  int fd;
+  if (cellFsOpen("/dev_hdd0/tmp/xpad_log.txt",
+                 CELL_FS_O_WRONLY | CELL_FS_O_CREAT | CELL_FS_O_APPEND, &fd,
+                 (uint64_t)0666, (void*)0) != 0) return;
+  uint64_t written;
+  cellFsWrite(fd, buf, len, &written);
+  cellFsClose(fd);
+}
+
+static void log_clear(void) {
+  cellFsUnlink("/dev_hdd0/tmp/xpad_log.txt");
+}
+
 static void show_msg(char* msg) {
   if (strlen(msg) > 200) {
     msg[200] = 0;
   }
+  log_msg("%s", msg);
   vshtask_A02D46E7(0, msg);
 }
 
@@ -472,6 +609,28 @@ static int32_t register_ldd_controller(XPAD_UNIT_t *unit) {
     snprintf(msg, sizeof(msg), "XPAD ldd port unit:%d port:%d", unit->number, port);
     show_msg(msg);
     cellPadSetPortSetting(port, port_setting);
+
+    // Patch device_type from 5 (LDD) to 0 (STANDARD) so games like GTA V
+    // accept our controller. Scan LV2 for the device_type array at runtime.
+    if (port >= 0 && port < 7) {
+      static uint64_t dt_addr = 0;  // cache: scan once per plugin load
+      if (dt_addr == 0) {
+        dt_addr = find_device_type_array();
+        if (dt_addr != 0) {
+          snprintf(msg, sizeof(msg), "XPAD device_type[] at 0x%llx", (unsigned long long)dt_addr);
+          show_msg(msg);
+        } else {
+          show_msg((char *)"XPAD device_type[] NOT FOUND");
+        }
+      }
+      if (dt_addr != 0) {
+        uint64_t addr = dt_addr + (uint64_t)port * 4;
+        if (lv2_poke32(addr, 0) == 0) {
+          snprintf(msg, sizeof(msg), "XPAD patched device_type[%d]=0", port);
+          show_msg(msg);
+        }
+      }
+    }
 
     // set Xbox led corresponding to port number
     unit->set_led(unit->number, xpad_led[port%4]);
@@ -1527,6 +1686,7 @@ static int xpadd_thread(uint64_t arg) {
   int32_t i, r;
   XPAD_UNIT_t *unit;
 
+  log_clear();
   // wait until we're back in xmb
   sys_timer_sleep(10);
   show_msg((char *)"XPAD Starting");

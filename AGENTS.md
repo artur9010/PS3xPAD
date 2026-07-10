@@ -445,3 +445,320 @@ The hypervisor (LV1) maps LV2 memory at an offset that differs per CFW version. 
 ### Key learning: no syscall 8/9 test from VSH plugin
 
 Never test syscall 8/9 from within a VSH plugin running on the target PS3. A wrong LV2 offset = hypervisor fault = permanently frozen console requiring hard power cycle + safe mode recovery. Test LV1/LV2 access from a minimal standalone self-contained test payload first (loaded fresh each boot, no persistence).
+
+## Session: 2026-07-10 (part 3 — device_type patch research)
+
+### PS3 state update
+
+- PS3 recovered from previous crash
+- Now running **4.93 CEX EvilNat Cobra 8.5** on clean disk
+- DualShock 3 and SATA adapter available for restoration if needed
+- webMAN MOD 1.47.48 [Rebug-PS3MAPI] running, supports `/peek.lv2` and `/poke.lv2`
+
+### LV2_OFFSET_ON_LV1 for 4.93 EvilNat — CONFIRMED CORRECT
+
+**Key finding from webMAN-MOD issue #1338:**
+> "LV1 and LV2 offsets are the same from 4.75 to 4.93, except 4.80 & 4.90 which both use the same offsets."
+
+So for 4.93 EvilNat CEX: `LV2_OFFSET_ON_LV1 = 0x8000000` is correct.
+
+The previous crash on 4.90 EvilNat was specific to that version (kernel ported from 4.84 DEX with different mapping). 4.93 uses the standard mapping.
+
+**Proof — LV2 peek test:**
+- `curl http://192.168.1.128/peek.lv2?0x2ED818` returned `43 45 58 00 00 00 00 00` ("CEX\0\0\0\0\0") — exact value expected from webMAN-MOD's `detect_firmware` function
+- `curl http://192.168.1.128/peek.lv2?0x2FCB68` returned firmware build date `2026/01/08 15:07:17` — confirms 4.93
+- This proves syscall 8 (LV1 peek) with `LV2_OFFSET_ON_LV1 = 0x8000000` works correctly on this setup
+
+### webMAN MOD peek/poke endpoints
+
+From `webMAN-MOD/include/ps3mapi/peek_poke.h`:
+
+```c
+#define SC_PEEK_LV2 (6)
+#define SC_POKE_LV2 (7)
+#define SC_PEEK_LV1 (8)    // CFW: reads LV2 when addr + LV2_OFFSET_ON_LV1
+#define SC_POKE_LV1 (9)    // CFW: writes LV2 when addr + LV2_OFFSET_ON_LV1
+#define SC_PEEK_LV1_COBRA (11)
+
+#define PS3MAPI_OPCODE_LV2_PEEK 0x1006
+#define PS3MAPI_OPCODE_LV2_POKE 0x1007
+#define PS3MAPI_OPCODE_LV1_PEEK 0x1008
+#define PS3MAPI_OPCODE_LV1_POKE 0x1009
+#define SYSCALL8_OPCODE_PS3MAPI 0x7777
+
+// LV2 peek via CFW syscall (safe, no PS3MAPI):
+static u64 lv2_peek_cfw(u64 addr) {
+    system_call_1(SC_PEEK_LV1, addr + LV2_OFFSET_ON_LV1);
+    return (u64) p1;
+}
+
+// LV2 poke via CFW syscall (safe, no PS3MAPI):
+static void lv2_poke_cfw(u64 addr, u64 value) {
+    system_call_2(SC_POKE_LV1, addr + LV2_OFFSET_ON_LV1, value);
+}
+```
+
+**Key insight:** Use CFW syscalls 8/9 directly (not PS3MAPI opcodes) to avoid the kernel panic issue. PS3MAPI goes through syscall 8 with opcode 0x7777 which can return ENOSYS → kernel panic. Direct syscall 8/9 with LV2_OFFSET_ON_LV1 works reliably.
+
+### PUP file available
+
+- Path: `/home/artur9010/Desktop/PS3UPDAT.PUP` (216069372 bytes = 216MB)
+- Firmware: 4.93
+
+### Available tools
+
+- **scetool** binary exists at `/home/artur9010/.local/share/containers/storage/overlay/6a297cc9cf78d448f2345feacb41239e9a17dea4e60a9903c43ac544aa87af70/diff/opt/scetool/scetool` — but won't run on NixOS host (dynamic linking issue)
+- **oscetool** source at `ext_sources/oscetool/` — buildable via `Dockerfile.oscetool` with podman
+- **ps3keys** at `ext_sources/ps3keys/` — only up to revision 3.56
+- **podman 5.8.2** available for container builds
+- **scetool keys** (ps3keys format): only up to 3.56 — for 4.93 decryption, need 4.55+ keys from archive.midnightchannel.net
+
+### Why PUP decryption may not be needed
+
+The `device_type[]` array is a runtime variable in LV2 memory. We can find it directly by searching live LV2 memory without decrypting lv2_kernel.self:
+
+1. When DualSense is connected and plugin is loaded:
+   - `device_type[0]` = 5 (our LDD controller)
+   - `device_type[1..6]` = 0 (no other controllers)
+
+2. Search LV2 for the byte pattern `05 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00` (7 × u32 = 28 bytes)
+
+3. Use webMAN MOD's `/find.lv2` to locate the array
+
+4. Verify by reading nearby fields (port_status, device_capability should be adjacent)
+
+### Plan: Patch device_type=5→0 via LV2 poke
+
+**Goal:** Make GTA V and other games accept DualSense as standard controller (device_type=0 instead of 5)
+
+**Steps:**
+1. Connect DualSense, load current `src/xpad.sprx` (registers LDD, sets device_type[0]=5)
+2. Use `/find.lv2` to locate `device_type[7]` array in LV2 memory
+3. Verify address by reading surrounding data (should be pad manager struct)
+4. Test poke: `/poke.lv2?<addr>=0` then `/peek.lv2?<addr>` to verify
+5. Load GTA V, test if controller input works
+6. If yes, automate in plugin: add LV2 poke after LDD registration
+
+**Plugin automation code (to add to `register_ldd_controller` in src/main.c):**
+```c
+// Patch device_type from 5 to 0 so games accept our controller
+// Address determined at runtime via /find.lv2, hardcoded here
+// LV2_OFFSET_ON_LV1 = 0x8000000 for 4.93 EvilNat CEX
+#define DEVICE_TYPE_ARRAY_ADDR 0x????  // TODO: find via /find.lv2
+system_call_2(9, DEVICE_TYPE_ARRAY_ADDR + 0x8000000ULL, 0);
+```
+
+**Risks:**
+- Wrong address → crash or no effect (mitigated: read before write, verify change)
+- device_type gets reset by kernel after poke (needs test)
+- GTA V may check other fields beyond device_type (vendor_id, product_id, capability)
+
+**Fallback if device_type patch doesn't fix GTA V:**
+- Also patch `vendor_id` and `product_id` to match DualShock 3 (0x054c/0x0268)
+- Patch `device_capability` to match standard DS3
+
+### Approach rejected: "Native HID + only add what's missing"
+
+User suggested: let native HID driver handle basic controls, only add PS button/rumble/gyro via LDD.
+
+**Why impossible:**
+- PS3 USB stack is winner-takes-all: LDD replaces native driver for the device
+- `sys_usbd_open_pipe` (RPCS3 source) only works on devices in `handled_devices` map (LDD-owned)
+- `cellUsbdGetDeviceList` only returns LDD-owned devices
+- No documented path from VSH plugin to open pipes on a native-driver-owned device
+- PL3 kernel module uses kernel-level USB functions not available to user-space plugins
+
+**Conclusion:** Must use LDD to access USB. Cannot coexist with native HID driver.
+
+### webMAN MOD endpoints available
+
+- `http://192.168.1.128/peek.lv2?<addr>` — read 256 bytes at LV2 address
+- `http://192.168.1.128/poke.lv2?<addr>=<value>` — write 64-bit value at LV2 address
+- `http://192.168.1.128/find.lv2?<pattern>` — search LV2 memory for pattern
+- `http://192.168.1.128/peek.lv1?<addr>` — read LV1 memory
+- `http://192.168.1.128/poke.lv1?<addr>=<value>` — write LV1 memory
+- `http://192.168.1.128/cpursx.ps3` — system info (firmware, temp, etc.)
+- `http://192.168.1.128/vshplugin.ps3mapi` — VSH plugin slots
+- `http://192.168.1.128/loadprx.ps3?slot=<n>&prx=<path>` — manually load PRX
+
+### Session 2026-07-10 (part 3) — DualShock 3 verification
+
+- Tested with DualShock 3 plugged in — works natively without plugin (basic controls)
+- Confirms native HID driver handles DS3 correctly
+- DualSense also handled by native HID driver for basic controls (buttons, sticks)
+- Only missing: PS button, rumble, gyroscope (vendor-specific HID usages)
+
+### Current status
+
+- Waiting for user to download GTA V before testing device_type patch
+- User has DualShock 3 and SATA adapter as fallback if PS3 crashes
+- webMAN MOD endpoints sometimes timeout under load — may need retries
+
+### Plugin loading policy (2026-07-10)
+
+- **DO NOT add xpad.sprx to boot_plugins.txt** — plugin is loaded manually only
+- Manual load via `curl http://192.168.1.128/loadprx.ps3?slot=2&prx=/dev_hdd0/plugins/xpad.sprx`
+- Reason: allows quick unload/load cycle during testing without reboot, avoids persistent state issues
+
+## Session: 2026-07-11 — Device type patch, runtime scanner
+
+### webMAN build: 1.47.48q MOD [Rebug-PS3MAPI]
+
+- Standard build, **NO `DEBUG_MEM`** support
+- Available endpoints: `/peek.lv2`, `/poke.lv2`, `/find.lv2`, `/cpursx.ps3`, `/vshplugin.ps3mapi`
+- **NOT available**: `/dump.ps3?lv2` (returns 404 — needs `DEBUG_MEM`)
+- PS3MAPI (syscall 8) **works fine** on 4.93 EvilNat 4.93 (was a previous 4.90 issue)
+- Cobra 8.5 + EvilNat 4.93 confirmed
+
+### CRITICAL LESSON: Don't hammer webMAN with HTTP scans
+
+- **Heavy `/peek.lv2` loops or `/find.lv2` over LV2 (8MB) wedges webMAN**
+- Symptom: PS3 itself is fine, but webMAN stops responding (ping OK, HTTP times out)
+- console "died" / power-cycled twice during this session — actually webMAN wedged, not console death
+- Recovery: just power-cycle (webMAN restarts), no need for safe mode
+- **Solution for any LV2 scanning**: do it INSIDE a VSH plugin via direct `system_call_1(8, addr + 0x8000000)` calls — no HTTP overhead, fast, doesn't wedge webMAN
+
+### Plugin LV2 scanner (2026-07-11)
+
+Added runtime LV2 scanner to `src/main.c`. After LDD registration succeeds, scans `0x100000 - 0x1000000` (16MB) looking for `device_type[7]` array pattern: `[05 00 00 00] [00 00 00 00] ×6`. Verifies by reading `addr - 96` for `max_connect = 7` and `now_connect >= 1`.
+
+**Result: "XPAD device_type[] NOT FOUND"** — no candidates matching the pattern found in 16MB of LV2.
+
+### Root cause: device_type not stored as expected
+
+The `device_type` field is **not** a simple `u32[7]` array in LV2 static memory. Looking at RPCS3's `Pad` class:
+```cpp
+struct Pad {
+    bool ldd;  // <-- this is what determines device_type
+    u32 m_device_type;  // <-- set by kernel based on ldd flag
+    ...
+};
+```
+
+Each controller has its own `Pad` object with `m_device_type = 5` (LDD) or `0` (standard). `cellPadGetInfo2` reads from these per-controller objects, not from a contiguous array.
+
+The kernel computes `device_type` at query time based on whether the controller is an LDD. It's NOT a settable user value — it's an inherent property of how the controller was registered.
+
+### Why LV2 poke can't fix device_type
+
+- `device_type` is per-controller, in a kernel heap object (not static memory)
+- Its value is determined by the LDD registration path, not a configurable field
+- Even if we found the Pad object and patched `m_device_type=0`, the kernel code that reads it might re-derive it from the LDD flag
+- The Pad object's address is allocated dynamically, hard to find without knowing internal allocation patterns
+
+### Implications: hard reality about game compatibility
+
+**GTA V and similar games check `device_type != 0` and reject LDD controllers.** This is a kernel-level property, not user-configurable. The only ways to make these games accept our controller:
+
+1. **EBOOT patching per-game** — patch GTA V's binary to accept `device_type=5`. Per-game work.
+2. **DEX + debug EBOOT compatibility mode** — original PS3xPAD v0.8 had this, but requires DEX firmware + debug EBOOT signature.
+3. **LV2 kernel code patching** — patch the kernel function that sets `device_type` for LDD controllers. Highly risky, would crash on wrong kernel version.
+4. **Accept the limitation** — many games work fine via LDD (Minecraft confirmed). GTA V/SC5 won't.
+
+### What still works
+
+- Basic DualSense input on XMB and most games via LDD
+- PS button (via `vshtask_A02D46E7` import stub)
+- LED control (green on connect)
+- All standard buttons, sticks, triggers
+
+### Verified: webMAN build + endpoints
+
+- webMAN MOD 1.47.48q MOD [Rebug-PS3MAPI] on 4.93 CEX EvilNat Cobra 8.5
+- Endpoints confirmed working: `/peek.lv2`, `/poke.lv2`, `/find.lv2`, `/cpursx.ps3`, `/vshplugin.ps3mapi`, `/loadprx.ps3`
+- NOT available without DEBUG_MEM: `/dump.ps3?lv2`
+- **CRITICAL: heavy `/find.lv2` over full LV2 OR many `/peek.lv2` calls in a loop WEDGES webMAN** (PS3 stays alive, just webMAN HTTP unresponsive). Recoverable by power cycle.
+
+### Plugin load results on 4.93 (2026-07-11)
+
+- xpad.sprx loaded into slot 2 as `XPADD`
+- LDD registration succeeded (notification visible to user)
+- LV2 scanner ran 16MB range — zero `[5,0,0,0,0,0,0]` candidates found
+- Scanner reported `XPAD device_type[] NOT FOUND`
+- **Conclusion: device_type is not a LV2-static array**
+
+### Plugin status
+
+- Current build (11323 bytes) has runtime scanner + LV2 poke scaffold
+- `DEVICE_TYPE_ARRAY_ADDR=0` — never set, would not poke anything
+- Keep scanner for now (per-load cost ~600ms, useful diagnostic)
+- Alternative approaches to game compatibility must be explored separately
+
+## Session: 2026-07-11 (continued) — Critical bugfix: lv2_peek64 was broken
+
+### Bug discovery via file logging
+
+Initial `lv2_peek64()` used `system_call_1(8, addr); return (uint64_t)p1;`. But `p1` is a `register` variable defined **inside** the `lv2syscall1` macro body — it does NOT exist outside the macro scope. So the function was returning garbage from whatever happened to be in a register.
+
+The scan reported `cand8#1 at 0x5C2E00` (u8 byte pattern match). When checked via webMAN `/peek.lv2?5C2E00`, that address contained `00` at byte 0, not `05`. The `lv2_peek64` was clearly broken — file logging caught the bug.
+
+### Fix
+
+Rewrote `lv2_peek64()`, `lv2_poke32()`, and `prx_get_module_id_by_address()` using inline asm directly:
+
+```c
+static inline uint64_t lv2_peek64(uint64_t lv2_addr) {
+  register uint64_t p1 asm("3") = lv2_addr + 0x8000000ULL;
+  register uint64_t scn asm("11") = 8;
+  __asm__ __volatile__("sc"
+                       : "+r"(p1)
+                       :
+                       : "r0","r12","lr","ctr","xer","cr0","cr1","cr5","cr6","cr7","memory");
+  return p1;
+}
+```
+
+### File logging implementation
+
+Added `log_msg()` helper that appends to `/dev_hdd0/tmp/xpad_log.txt`. `show_msg()` now also logs to file (via FTP/webMAN we can see plugin activity without being at the console). `log_clear()` truncates log at plugin start.
+
+Added `vsnprintf` to `src/libc.c` (was missing — caused format errors with `%u`, `%llx`). Extended local printf to handle `%u`, `%lu`, `%llu`, `%llx`, `%lx`.
+
+### After fix: scanner confirms no device_type array in 32MB
+
+Log after rebuild and reload:
+```
+XPAD StartingXPAD Loaded!XPAD ldd registered unit:0 handle:0
+XPAD ldd port unit:0 port:0
+XPAD scan1 done 0 cands
+XPAD scan2 done 0 cands
+XPAD device_type[] NOT FOUND
+```
+
+**Zero candidates in 32MB range.** The earlier `0x5C2E00` match was from the broken peek returning garbage. **`device_type` is NOT stored as a static array in LV2 memory within 32MB.**
+
+### Final conclusion
+
+The PS3 kernel stores pad data as per-controller objects (likely in kernel heap), not as a contiguous `device_type[7]` array. The `device_type=5` value is computed at query time when `cellPadGetInfo2` is called.
+
+**LV2 poke approach cannot fix GTA V game compatibility.** The earlier assumption that device_type lives at a fixed LV2 address was wrong.
+
+### Real options for GTA V compatibility
+
+1. **EBOOT patch GTA V** — patch game's binary to accept device_type=5
+2. **Accept limitation** — DualSense works on XMB and games that don't check device_type
+3. **DEX + debug EBOOT compatibility mode** — requires DEX firmware + debug EBOOT signature
+
+### File log confirmation (via FTP)
+
+```
+$ curl http://192.168.1.128/dev_hdd0/tmp/xpad_log.txt
+XPAD StartingXPAD Loaded!XPAD ldd registered unit:0 handle:0XPAD ldd port unit:0 port:0XPAD scan1 done 0 candsXPAD scan2 done 0 candsXPAD device_type[] NOT FOUND
+```
+
+The plugin logs ALL `show_msg()` calls. The scanner reports:
+- `scan1 done 0 cands` — no u32 array matches
+- `scan2 done 0 cands` — no u8 array matches
+- `device_type[] NOT FOUND` — no verified match
+
+### Lesson learned
+
+**Without file logging, the broken lv2_peek64 would have stayed undetected.** VSH notifications require being at the console. File logging lets us inspect plugin behavior remotely. **All future plugins MUST include file logging** — add `log_msg()` calls at every key point.
+
+### Plugin state (2026-07-11)
+
+- Current build: 11838 bytes
+- Scanner + log_msg + lv2_peek64/poke32 inline asm
+- Plugin NOT adding itself to boot_plugins.txt — manual load only (per user policy)
+- Loaded into slot 2, scanner reports NOT FOUND
+- Next: discuss with user which direction to take (EBOOT patch / accept / etc.)
