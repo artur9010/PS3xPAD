@@ -1,6 +1,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef USE_PSL1GHT
+#include "psl1ght_compat.h"
+#else
 #include <sys/ppu_thread.h>
 #include <sys/process.h>
 #include <sys/prx.h>
@@ -12,24 +15,28 @@
 #include <cell/pad.h>
 #include <cell/pad/libpad_dbg.h>
 #include <cell/usbd.h>
+#endif
 #include "ControlStruct.h"
 
 #define THREAD_NAME "xpaddt"
 #define STOP_THREAD_NAME "xpadds"
 #define MAX_XPAD_DEV_NUM ((int32_t)(sizeof(xpad_info) / sizeof(xpad_info[0])))
 #define MAX_XPADW_DEV_NUM ((int32_t)(sizeof(xpadw_info) / sizeof(xpadw_info[0])))
+#define MAX_DUALSENSE_DEV_NUM ((int32_t)(sizeof(dualsense_info) / sizeof(dualsense_info[0])))
 #define MAX_XPAD_NUM CELL_PAD_MAX_PORT_NUM
 #define MAX_XPADW_NUM 4
 #define XPAD_DATA_LEN 14+2 // +2 for count and size fields
 #define XPADW_DATA_LEN 0x13+2
-#define MAX_XPAD_DATA_LEN XPADW_DATA_LEN
+#define DUALSENSE_DATA_LEN 64+2
+#define MAX_XPAD_DATA_LEN DUALSENSE_DATA_LEN
 #define RINGBUF_SIZE  10
 #define DESCRIPTOR_TABLE_SIZE (sizeof(descriptor_table)/sizeof(descriptor_table_t))
 #define SWAP16(x) ((uint16_t)((((x) & 0x00FF) << 8) | (((x) & 0xFF00) >> 8)))
 
 enum XTYPES {
   XTYPE_XBOX360 = 1,
-  XTYPE_XBOX360W = 2
+  XTYPE_XBOX360W = 2,
+  XTYPE_DUALSENSE = 3
 };
 
 typedef struct xpad_device {
@@ -62,8 +69,12 @@ static XPAD_INFO_t xpad_info[] = {
 };
 
 static XPAD_INFO_t xpadw_info[] = {
- {0x045e, 0x0291, "Xbox 360 Wireless Receiver (XBOX)"},
- {0x045e, 0x0719, "Xbox 360 Wireless Receiver"},
+  {0x045e, 0x0291, "Xbox 360 Wireless Receiver (XBOX)"},
+  {0x045e, 0x0719, "Xbox 360 Wireless Receiver"},
+};
+
+static XPAD_INFO_t dualsense_info[] = {
+  {0x054c, 0x0ce6, "Sony DualSense Wireless Controller"},
 };
 
 typedef struct {
@@ -129,6 +140,16 @@ static void xpadw_read_report(int32_t id, uint8_t *readBuf);
 static int32_t xpadw_set_led(int32_t id, uint8_t led);
 static int32_t xpadw_set_rumble(int32_t id, uint8_t lval, uint8_t rval);
 
+// wired DualSense methods
+static int32_t dualsense_probe(int32_t dev_id);
+static int32_t dualsense_attach(int32_t dev_id);
+static int32_t dualsense_detach(int32_t dev_id);
+static int32_t dualsense_detach_all(void);
+static int32_t dualsense_read_input(int32_t id, void *data);
+static void dualsense_read_report(int32_t id, uint8_t *readBuf);
+static int32_t dualsense_set_led(int32_t id, uint8_t led);
+static int32_t dualsense_set_rumble(int32_t id, uint8_t lval, uint8_t rval);
+
 // common methods
 static void data_transfer_done(int32_t result, int32_t count, void *arg);
 static void data_transfer(XPAD_UNIT_t *unit);
@@ -143,6 +164,8 @@ static int32_t unregister_ldd_controller(XPAD_UNIT_t *unit);
 // vsh methods
 void *getNIDfunc(const char *vsh_module, uint32_t fnid, int32_t offset);
 static void show_msg(char *msg);
+static const char *device_name(XPAD_INFO_t *info, uint32_t count, uint16_t vid, uint16_t pid);
+static void show_usb_msg(const char *event, int32_t dev_id, uint16_t vid, uint16_t pid, const char *name);
 int (*vshtask_notify)(int, const char *) = NULL;
 void *(*vsh_malloc)(unsigned int size) = NULL;
 int (*vsh_free)(void *ptr) = NULL;
@@ -174,6 +197,13 @@ static CellUsbdLddOps xpadw_ops = {
   xpadw_detach
 };
 
+static CellUsbdLddOps dualsense_ops = {
+  0,
+  dualsense_probe,
+  dualsense_attach,
+  dualsense_detach
+};
+
 static XPAD_t XPAD;
 static uint8_t xpad_led[4] = {ledOn1, ledOn2, ledOn3, ledOn4};
 static sys_ppu_thread_t thread_id = 1;
@@ -184,6 +214,9 @@ static volatile uint8_t running;
 SYS_MODULE_INFO(XPADD, 0, 1, 0);
 SYS_MODULE_START(xpadd_start);
 SYS_MODULE_STOP(xpadd_stop);
+#ifdef USE_PSL1GHT
+SYS_PROCESS_PARAM_FIXED(1000, 0x2000);
+#endif
 
 static inline void _sys_ppu_thread_exit(uint64_t val) {
   system_call_1(41, val);
@@ -252,6 +285,24 @@ static void show_msg(char* msg) {
   if (vshtask_notify) {
     vshtask_notify(0, msg);
   }
+}
+
+static const char *device_name(XPAD_INFO_t *info, uint32_t count, uint16_t vid, uint16_t pid) {
+  uint32_t i;
+
+  for (i = 0; i < count; i++) {
+    if (info[i].vid == vid && info[i].pid == pid) {
+      return(info[i].name);
+    }
+  }
+  return(NULL);
+}
+
+static void show_usb_msg(const char *event, int32_t dev_id, uint16_t vid, uint16_t pid, const char *name) {
+  char msg[160];
+
+  snprintf(msg, sizeof(msg), "XPAD %s dev:%d vid:%04x pid:%04x %s", event, dev_id, vid, pid, name ? name : "");
+  show_msg(msg);
 }
 
 static void *_malloc(unsigned int size) {
@@ -362,6 +413,10 @@ static XPAD_UNIT_t *unit_alloc(int32_t dev_id, int32_t payload, uint8_t ifnum, u
       unit->read_input = xpadw_read_input;
       unit->set_led = xpadw_set_led;
       unit->set_rumble = xpadw_set_rumble;
+    } else if (xtype == XTYPE_DUALSENSE) {
+      unit->read_input = dualsense_read_input;
+      unit->set_led = dualsense_set_led;
+      unit->set_rumble = dualsense_set_rumble;
     }
     block(xpad_mutex);
     unit->number = XPAD.next_number;
@@ -385,6 +440,7 @@ static XPAD_UNIT_t *unit_alloc(int32_t dev_id, int32_t payload, uint8_t ifnum, u
 
 static int32_t register_ldd_controller(XPAD_UNIT_t *unit) {
   uint8_t data[0x114];
+  char msg[80];
   int32_t port;
   uint32_t capability, mode, port_setting;
 
@@ -397,6 +453,8 @@ static int32_t register_ldd_controller(XPAD_UNIT_t *unit) {
     if (handle[unit->number] < 0) {
       return(handle[unit->number]);
     }
+    snprintf(msg, sizeof(msg), "XPAD ldd registered unit:%d handle:%d", unit->number, handle[unit->number]);
+    show_msg(msg);
 
     // all pad data into games
     mode = CELL_PAD_LDD_INSERT_DATA_INTO_GAME_MODE_ON; // = (1)
@@ -408,6 +466,8 @@ static int32_t register_ldd_controller(XPAD_UNIT_t *unit) {
     if (port < 0) {
       return(port);
     }
+    snprintf(msg, sizeof(msg), "XPAD ldd port unit:%d port:%d", unit->number, port);
+    show_msg(msg);
     cellPadSetPortSetting(port, port_setting);
 
     // set Xbox led corresponding to port number
@@ -468,6 +528,7 @@ static int32_t xpad_probe(int32_t dev_id) {
   // make sure product id and vendor id are valid
   idVendor = SWAP16(ddesc->idVendor);
   idProduct = SWAP16(ddesc->idProduct);
+  show_usb_msg("x360 probe", dev_id, idVendor, idProduct, device_name(xpad_info, MAX_XPAD_DEV_NUM, idVendor, idProduct));
   for (i = 0; i < MAX_XPAD_DEV_NUM; i++) {
     if (xpad_info[i].vid == idVendor && xpad_info[i].pid == idProduct) {
       return(CELL_USBD_PROBE_SUCCEEDED);
@@ -478,11 +539,19 @@ static int32_t xpad_probe(int32_t dev_id) {
 
 static int32_t xpad_attach(int32_t dev_id) {
   int32_t payload, port;
+  uint16_t idVendor = 0, idProduct = 0;
   uint32_t mode, port_setting;
+  UsbDeviceDescriptor *ddesc;
   UsbConfigurationDescriptor *cdesc;
   UsbInterfaceDescriptor *idesc;
   UsbEndpointDescriptor *edesc;
   XPAD_UNIT_t *unit;
+
+  if ((ddesc = (UsbDeviceDescriptor *)cellUsbdScanStaticDescriptor(dev_id, NULL, USB_DESCRIPTOR_TYPE_DEVICE)) != NULL) {
+    idVendor = SWAP16(ddesc->idVendor);
+    idProduct = SWAP16(ddesc->idProduct);
+    show_usb_msg("x360 attach", dev_id, idVendor, idProduct, device_name(xpad_info, MAX_XPAD_DEV_NUM, idVendor, idProduct));
+  }
 
   if ((cdesc = (UsbConfigurationDescriptor *) cellUsbdScanStaticDescriptor(dev_id, NULL, USB_DESCRIPTOR_TYPE_CONFIGURATION)) == NULL) {
     return (CELL_USBD_ATTACH_FAILED);
@@ -532,7 +601,15 @@ static int32_t xpad_attach(int32_t dev_id) {
 
 static int32_t xpad_detach(int32_t dev_id) {
   int32_t r;
+  uint16_t idVendor = 0, idProduct = 0;
+  UsbDeviceDescriptor *ddesc;
   XPAD_UNIT_t *unit;
+
+  if ((ddesc = (UsbDeviceDescriptor *)cellUsbdScanStaticDescriptor(dev_id, NULL, USB_DESCRIPTOR_TYPE_DEVICE)) != NULL) {
+    idVendor = SWAP16(ddesc->idVendor);
+    idProduct = SWAP16(ddesc->idProduct);
+    show_usb_msg("x360 detach", dev_id, idVendor, idProduct, device_name(xpad_info, MAX_XPAD_DEV_NUM, idVendor, idProduct));
+  }
 
   // Xbox controller has been unplugged
   // disconnect virtual controller associated to it
@@ -803,6 +880,7 @@ static int32_t xpadw_probe(int32_t dev_id) {
   // make sure product id and vendor id are valid
   idVendor = SWAP16(ddesc->idVendor);
   idProduct = SWAP16(ddesc->idProduct);
+  show_usb_msg("x360w probe", dev_id, idVendor, idProduct, device_name(xpadw_info, MAX_XPADW_DEV_NUM, idVendor, idProduct));
   for (i = 0; i < MAX_XPADW_DEV_NUM; i++) {
     if (xpadw_info[i].vid == idVendor && xpadw_info[i].pid == idProduct) {
       return(CELL_USBD_PROBE_SUCCEEDED);
@@ -812,8 +890,16 @@ static int32_t xpadw_probe(int32_t dev_id) {
 }
 
 static int xpadw_attach(int32_t dev_id) {
+  uint16_t idVendor = 0, idProduct = 0;
   uint8_t* desc = 0;
   uint32_t i;
+  UsbDeviceDescriptor *ddesc;
+
+  if ((ddesc = (UsbDeviceDescriptor *)cellUsbdScanStaticDescriptor(dev_id, NULL, USB_DESCRIPTOR_TYPE_DEVICE)) != NULL) {
+    idVendor = SWAP16(ddesc->idVendor);
+    idProduct = SWAP16(ddesc->idProduct);
+    show_usb_msg("x360w attach", dev_id, idVendor, idProduct, device_name(xpadw_info, MAX_XPADW_DEV_NUM, idVendor, idProduct));
+  }
 
   // Xbox 360 wireless receivers have 4 endpoints (1 per controller)
   // all 4 need to be listened to at all times in case of controller connection/disconnection
@@ -836,6 +922,14 @@ static int xpadw_attach(int32_t dev_id) {
 
 static int32_t xpadw_detach(int32_t dev_id) {
   int32_t r;
+  uint16_t idVendor = 0, idProduct = 0;
+  UsbDeviceDescriptor *ddesc;
+
+  if ((ddesc = (UsbDeviceDescriptor *)cellUsbdScanStaticDescriptor(dev_id, NULL, USB_DESCRIPTOR_TYPE_DEVICE)) != NULL) {
+    idVendor = SWAP16(ddesc->idVendor);
+    idProduct = SWAP16(ddesc->idProduct);
+    show_usb_msg("x360w detach", dev_id, idVendor, idProduct, device_name(xpadw_info, MAX_XPADW_DEV_NUM, idVendor, idProduct));
+  }
 
   // Xbox wireless receiver has been unplugged
   // disconnect all virtual controllers associated to it
@@ -1019,6 +1113,234 @@ static int32_t xpadw_set_rumble(int32_t id, uint8_t lval, uint8_t rval) {
 }
 // end of wireless controller specific methods
 
+// start of wired DualSense specific methods
+static int32_t dualsense_probe(int32_t dev_id) {
+  uint16_t idVendor, idProduct;
+  uint32_t i;
+  UsbDeviceDescriptor *ddesc;
+
+  block(xpad_mutex);
+  if (XPAD.n >= MAX_XPAD_NUM) {
+    unblock(xpad_mutex);
+    return(CELL_USBD_PROBE_FAILED);
+  }
+  unblock(xpad_mutex);
+  if ((ddesc = (UsbDeviceDescriptor *)cellUsbdScanStaticDescriptor(dev_id, NULL, USB_DESCRIPTOR_TYPE_DEVICE)) == NULL) {
+    return(CELL_USBD_PROBE_FAILED);
+  }
+
+  idVendor = SWAP16(ddesc->idVendor);
+  idProduct = SWAP16(ddesc->idProduct);
+  show_usb_msg("ds probe", dev_id, idVendor, idProduct, device_name(dualsense_info, MAX_DUALSENSE_DEV_NUM, idVendor, idProduct));
+  for (i = 0; i < MAX_DUALSENSE_DEV_NUM; i++) {
+    if (dualsense_info[i].vid == idVendor && dualsense_info[i].pid == idProduct) {
+      return(CELL_USBD_PROBE_SUCCEEDED);
+    }
+  }
+  return(CELL_USBD_PROBE_FAILED);
+}
+
+static int32_t dualsense_attach(int32_t dev_id) {
+  int32_t payload;
+  uint16_t idVendor = 0, idProduct = 0;
+  UsbDeviceDescriptor *ddesc;
+  UsbConfigurationDescriptor *cdesc;
+  UsbInterfaceDescriptor *idesc;
+  UsbEndpointDescriptor *edesc;
+  XPAD_UNIT_t *unit;
+
+  if ((ddesc = (UsbDeviceDescriptor *)cellUsbdScanStaticDescriptor(dev_id, NULL, USB_DESCRIPTOR_TYPE_DEVICE)) != NULL) {
+    idVendor = SWAP16(ddesc->idVendor);
+    idProduct = SWAP16(ddesc->idProduct);
+    show_usb_msg("ds attach", dev_id, idVendor, idProduct, device_name(dualsense_info, MAX_DUALSENSE_DEV_NUM, idVendor, idProduct));
+  }
+
+  if ((cdesc = (UsbConfigurationDescriptor *) cellUsbdScanStaticDescriptor(dev_id, NULL, USB_DESCRIPTOR_TYPE_CONFIGURATION)) == NULL) {
+    return(CELL_USBD_ATTACH_FAILED);
+  }
+  idesc = (UsbInterfaceDescriptor *)cdesc;
+  if ((idesc = (UsbInterfaceDescriptor *) cellUsbdScanStaticDescriptor(dev_id, idesc, USB_DESCRIPTOR_TYPE_INTERFACE)) == NULL) {
+    return(CELL_USBD_ATTACH_FAILED);
+  }
+  edesc = (UsbEndpointDescriptor *)idesc;
+  while ((edesc = (UsbEndpointDescriptor *) cellUsbdScanStaticDescriptor(dev_id, edesc, USB_DESCRIPTOR_TYPE_ENDPOINT)) != NULL) {
+    if (edesc->bEndpointAddress & 0x80) {
+      break;
+    }
+  }
+  if (edesc == NULL) {
+    return(CELL_USBD_ATTACH_FAILED);
+  }
+  payload = SWAP16(edesc->wMaxPacketSize);
+  if (payload < sizeof(DUALSENSE_USB_IN_REPORT)) {
+    return(CELL_USBD_ATTACH_FAILED);
+  }
+  if ((unit = unit_alloc(dev_id, payload, idesc->bInterfaceNumber, idesc->bAlternateSetting, XTYPE_DUALSENSE)) == NULL) {
+    return(CELL_USBD_ATTACH_FAILED);
+  }
+  if ((unit->c_pipe = cellUsbdOpenPipe(dev_id, NULL)) < 0) {
+    unit_free(unit);
+    return(CELL_USBD_ATTACH_FAILED);
+  }
+  if ((unit->i_pipe = cellUsbdOpenPipe(dev_id, edesc)) < 0) {
+    unit_free(unit);
+    return(CELL_USBD_ATTACH_FAILED);
+  }
+
+  cellUsbdSetPrivateData(dev_id, unit);
+  cellUsbdSetConfiguration(unit->c_pipe, cdesc->bConfigurationValue, set_config_done, unit);
+  block(xpad_mutex);
+  XPAD.n++;
+  XPAD.is_connected[unit->number] = 1;
+  XPAD.con_unit[unit->number] = unit;
+  register_ldd_controller(unit);
+  unblock(xpad_mutex);
+  return(CELL_USBD_ATTACH_SUCCEEDED);
+}
+
+static int32_t dualsense_detach(int32_t dev_id) {
+  uint16_t idVendor = 0, idProduct = 0;
+  UsbDeviceDescriptor *ddesc;
+  XPAD_UNIT_t *unit;
+
+  if ((ddesc = (UsbDeviceDescriptor *)cellUsbdScanStaticDescriptor(dev_id, NULL, USB_DESCRIPTOR_TYPE_DEVICE)) != NULL) {
+    idVendor = SWAP16(ddesc->idVendor);
+    idProduct = SWAP16(ddesc->idProduct);
+    show_usb_msg("ds detach", dev_id, idVendor, idProduct, device_name(dualsense_info, MAX_DUALSENSE_DEV_NUM, idVendor, idProduct));
+  }
+
+  if ((unit = (XPAD_UNIT_t *)cellUsbdGetPrivateData(dev_id)) == NULL) {
+    return(CELL_USBD_DETACH_FAILED);
+  }
+  block(xpad_mutex);
+  XPAD.n--;
+  XPAD.is_connected[unit->number] = 0;
+  XPAD.con_unit[unit->number] = NULL;
+  unregister_ldd_controller(unit);
+  unblock(xpad_mutex);
+  unit_free(unit);
+  return(CELL_USBD_DETACH_SUCCEEDED);
+}
+
+static int32_t dualsense_detach_all(void) {
+  int32_t i;
+  XPAD_UNIT_t *unit;
+
+  block(xpad_mutex);
+  for (i = 0; i < MAX_XPAD_NUM; i++) {
+    if (XPAD.is_connected[i]) {
+      unit = XPAD.con_unit[i];
+      if (unit->xtype == XTYPE_DUALSENSE) {
+        XPAD.n--;
+        XPAD.is_connected[unit->number] = 0;
+        XPAD.con_unit[unit->number] = NULL;
+        unregister_ldd_controller(unit);
+        unit_free(unit);
+      }
+    }
+  }
+  unblock(xpad_mutex);
+  return(CELL_USBD_DETACH_SUCCEEDED);
+}
+
+static void dualsense_read_report(int32_t id, uint8_t *readBuf) {
+  DUALSENSE_USB_IN_REPORT *report;
+  CellPadData data;
+  uint8_t hat;
+
+  report = (DUALSENSE_USB_IN_REPORT *)readBuf;
+  memset(&data, 0, sizeof(CellPadData));
+  data.len = 24;
+
+  data.button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X] = report->rx;
+  data.button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_Y] = report->ry;
+  data.button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X] = report->lx;
+  data.button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y] = report->ly;
+  data.button[CELL_PAD_BTN_OFFSET_SENSOR_X] = 0x0200;
+  data.button[CELL_PAD_BTN_OFFSET_SENSOR_Y] = 0x0200;
+  data.button[CELL_PAD_BTN_OFFSET_SENSOR_Z] = 0x0200;
+  data.button[CELL_PAD_BTN_OFFSET_SENSOR_G] = 0x0200;
+
+  hat = report->buttons0 & dsBtnHat;
+  if (hat == 0 || hat == 1 || hat == 7) data.button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= CELL_PAD_CTRL_UP;
+  if (hat == 3 || hat == 4 || hat == 5) data.button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= CELL_PAD_CTRL_DOWN;
+  if (hat == 5 || hat == 6 || hat == 7) data.button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= CELL_PAD_CTRL_LEFT;
+  if (hat == 1 || hat == 2 || hat == 3) data.button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= CELL_PAD_CTRL_RIGHT;
+
+  if (report->buttons2 & dsBtnPS) data.button[0] |= CELL_PAD_CTRL_LDD_PS;
+  if (report->buttons1 & dsBtnOptions) data.button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= CELL_PAD_CTRL_START;
+  if (report->buttons1 & dsBtnCreate) data.button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= CELL_PAD_CTRL_SELECT;
+  if (report->buttons1 & dsBtnR3) data.button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= CELL_PAD_CTRL_R3;
+  if (report->buttons1 & dsBtnL3) data.button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= CELL_PAD_CTRL_L3;
+
+  if (report->buttons0 & dsBtnSquare) data.button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= CELL_PAD_CTRL_SQUARE;
+  if (report->buttons0 & dsBtnCross) data.button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= CELL_PAD_CTRL_CROSS;
+  if (report->buttons0 & dsBtnCircle) data.button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= CELL_PAD_CTRL_CIRCLE;
+  if (report->buttons0 & dsBtnTriangle) data.button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= CELL_PAD_CTRL_TRIANGLE;
+  if (report->buttons1 & dsBtnR1) data.button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= CELL_PAD_CTRL_R1;
+  if (report->buttons1 & dsBtnL1) data.button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= CELL_PAD_CTRL_L1;
+  if ((report->buttons1 & dsBtnL2) || report->l2 > 0) data.button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= CELL_PAD_CTRL_L2;
+  if ((report->buttons1 & dsBtnR2) || report->r2 > 0) data.button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= CELL_PAD_CTRL_R2;
+
+  data.button[CELL_PAD_BTN_OFFSET_PRESS_L2] = report->l2;
+  data.button[CELL_PAD_BTN_OFFSET_PRESS_R2] = report->r2;
+  data.button[CELL_PAD_BTN_OFFSET_PRESS_L1] = (report->buttons1 & dsBtnL1) ? 0xFF : 0;
+  data.button[CELL_PAD_BTN_OFFSET_PRESS_R1] = (report->buttons1 & dsBtnR1) ? 0xFF : 0;
+  data.button[CELL_PAD_BTN_OFFSET_PRESS_UP] = (data.button[CELL_PAD_BTN_OFFSET_DIGITAL1] & CELL_PAD_CTRL_UP) ? 0xFF : 0;
+  data.button[CELL_PAD_BTN_OFFSET_PRESS_DOWN] = (data.button[CELL_PAD_BTN_OFFSET_DIGITAL1] & CELL_PAD_CTRL_DOWN) ? 0xFF : 0;
+  data.button[CELL_PAD_BTN_OFFSET_PRESS_LEFT] = (data.button[CELL_PAD_BTN_OFFSET_DIGITAL1] & CELL_PAD_CTRL_LEFT) ? 0xFF : 0;
+  data.button[CELL_PAD_BTN_OFFSET_PRESS_RIGHT] = (data.button[CELL_PAD_BTN_OFFSET_DIGITAL1] & CELL_PAD_CTRL_RIGHT) ? 0xFF : 0;
+  data.button[CELL_PAD_BTN_OFFSET_PRESS_SQUARE] = (report->buttons0 & dsBtnSquare) ? 0xFF : 0;
+  data.button[CELL_PAD_BTN_OFFSET_PRESS_CIRCLE] = (report->buttons0 & dsBtnCircle) ? 0xFF : 0;
+  data.button[CELL_PAD_BTN_OFFSET_PRESS_CROSS] = (report->buttons0 & dsBtnCross) ? 0xFF : 0;
+  data.button[CELL_PAD_BTN_OFFSET_PRESS_TRIANGLE] = (report->buttons0 & dsBtnTriangle) ? 0xFF : 0;
+
+  cellPadLddDataInsert(handle[id], &data);
+}
+
+static int32_t dualsense_read_input(int32_t id, void *data) {
+  unsigned char *p;
+  unsigned char *xpadbuf;
+  XPAD_UNIT_t *unit;
+
+  p = (unsigned char *)data;
+  if (id >= MAX_XPAD_NUM) {
+    return(-1);
+  }
+  if ((unit = XPAD.con_unit[id]) == NULL) {
+    return(-1);
+  }
+
+  block(ringbuf_mutex);
+  if (unit->rblen > 0) {
+    xpadbuf = &unit->ringbuf[unit->rp][0];
+    *p++ = xpadbuf[0];
+    *p++ = xpadbuf[1];
+    memcpy(p, &xpadbuf[2], unit->payload);
+    if (++unit->rp >= RINGBUF_SIZE) {
+      unit->rp = 0;
+    }
+    if (xpadbuf[1] >= sizeof(DUALSENSE_USB_IN_REPORT) && p[0] == 0x01) {
+      dualsense_read_report(unit->number, p);
+    }
+    unit->rblen--;
+  } else {
+    *p++ = 0;
+    memset(p, 0, unit->payload);
+  }
+  unblock(ringbuf_mutex);
+  return(0);
+}
+
+static int32_t dualsense_set_led(int32_t id, uint8_t led) {
+  return(CELL_OK);
+}
+
+static int32_t dualsense_set_rumble(int32_t id, uint8_t lval, uint8_t rval) {
+  return(CELL_OK);
+}
+// end of wired DualSense specific methods
+
 static int32_t check_pad_status(void) {
   int32_t i, cr, port, pad;
   XPAD_UNIT_t *unit;
@@ -1046,6 +1368,7 @@ static int32_t check_pad_status(void) {
 
 static int32_t init_usb(void) {
   int32_t r, i;
+  char msg[96];
   sys_mutex_attribute_t mutex_attr1;
   sys_mutex_attribute_t mutex_attr2;
 
@@ -1066,6 +1389,8 @@ static int32_t init_usb(void) {
   for (i = 0; i < MAX_XPAD_DEV_NUM; i++) {
     xpad_ops.name = xpad_info[i].name;
     if ((r = cellUsbdRegisterExtraLdd(&xpad_ops, xpad_info[i].vid, xpad_info[i].pid)) != CELL_OK) {
+      snprintf(msg, sizeof(msg), "XPAD reg fail x360 vid:%04x pid:%04x r:%d", xpad_info[i].vid, xpad_info[i].pid, r);
+      show_msg(msg);
       return(r);
     }
   }
@@ -1074,6 +1399,18 @@ static int32_t init_usb(void) {
   for (i = 0; i < MAX_XPADW_DEV_NUM; i++) {
     xpadw_ops.name = xpadw_info[i].name;
     if ((r = cellUsbdRegisterExtraLdd(&xpadw_ops, xpadw_info[i].vid, xpadw_info[i].pid)) != CELL_OK) {
+      snprintf(msg, sizeof(msg), "XPAD reg fail x360w vid:%04x pid:%04x r:%d", xpadw_info[i].vid, xpadw_info[i].pid, r);
+      show_msg(msg);
+      return(r);
+    }
+  }
+
+  // register wired DualSense controller device types
+  for (i = 0; i < MAX_DUALSENSE_DEV_NUM; i++) {
+    dualsense_ops.name = dualsense_info[i].name;
+    if ((r = cellUsbdRegisterExtraLdd(&dualsense_ops, dualsense_info[i].vid, dualsense_info[i].pid)) != CELL_OK) {
+      snprintf(msg, sizeof(msg), "XPAD reg fail ds vid:%04x pid:%04x r:%d", dualsense_info[i].vid, dualsense_info[i].pid, r);
+      show_msg(msg);
       return(r);
     }
   }
@@ -1089,6 +1426,9 @@ static int32_t shutdown_usb(void) {
   if (( r = cellUsbdUnregisterExtraLdd(&xpadw_ops)) != CELL_OK) {
     return(r);
   }
+  if (( r = cellUsbdUnregisterExtraLdd(&dualsense_ops)) != CELL_OK) {
+    return(r);
+  }
   if ((r = sys_mutex_destroy(ringbuf_mutex)) != CELL_OK) {
     return(r);
   }
@@ -1100,16 +1440,21 @@ static int32_t shutdown_usb(void) {
 
 static int xpadd_thread(uint64_t arg) {
   unsigned char xpad_data[MAX_XPAD_DATA_LEN];
+  char msg[64];
   int32_t i, r;
   XPAD_UNIT_t *unit;
 
+  // wait until we're back in xmb
+  sys_timer_sleep(10);
+  show_msg((char *)"XPAD Starting");
+
   r = init_usb();
   if (r < 0) {
+    snprintf(msg, sizeof(msg), "XPAD init failed r:%d", r);
+    show_msg(msg);
     sys_ppu_thread_exit(0);
   }
 
-  // wait until we're back in xmb
-  sys_timer_sleep(10);
   show_msg((char *)"XPAD Loaded!");
   running = 1;
   while (running) {
@@ -1128,15 +1473,23 @@ static int xpadd_thread(uint64_t arg) {
   // exiting...
   xpad_detach_all();
   xpadw_detach_all();
+  dualsense_detach_all();
   shutdown_usb();
   sys_ppu_thread_exit(0);
   return(0);
 }
 
 int xpadd_start(uint64_t arg) {
-  sys_ppu_thread_create(&thread_id, xpadd_thread, NULL, -0x1d8, 0x2000, SYS_PPU_THREAD_CREATE_JOINABLE, THREAD_NAME);
+  int32_t r;
+
+  r = sys_ppu_thread_create(&thread_id, xpadd_thread, NULL, -0x1d8, 0x2000, SYS_PPU_THREAD_CREATE_JOINABLE, THREAD_NAME);
+#ifdef USE_PSL1GHT
+  (void)r;
+  return(SYS_PRX_RESIDENT);
+#else
   _sys_ppu_thread_exit(0);
   return(SYS_PRX_RESIDENT);
+#endif
 }
 
 static void xpadd_stop_thread(uint64_t arg) {

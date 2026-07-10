@@ -26,7 +26,7 @@ PPU_PRX_STRIPFLAGS += --strip-debug --strip-section-header
 
 PPU_INCDIRS += -I$(CELL_TARGET_PATH)/ppu/include/cell/net
 PPU_SRCS = libc.c main.c
-PPU_PRX_LDLIBS 	= -lusbd_stub -lio_stub -lfs_stub #-ldbg_libio_stub
+PPU_LIBS += $(CELL_TARGET_PATH)/ppu/lib/libusbd_stub.a $(CELL_TARGET_PATH)/ppu/lib/libio_stub.a $(CELL_TARGET_PATH)/ppu/lib/libfs_stub.a
 PPU_PRX_TARGET = xpad.prx
 
 CLEANFILES = $(PRX_DIR)/$(PPU_SPRX_TARGET)
@@ -34,6 +34,16 @@ CLEANFILES = $(PRX_DIR)/$(PPU_SPRX_TARGET)
 all:
 	$(MAKE) $(PPU_OBJS_DEPENDS)
 	$(PPU_PRX_STRIP) $(PPU_PRX_STRIPFLAGS) $(PPU_PRX_TARGET)
-	scetool -0 SELF -1 TRUE -s FALSE -2 04 -3 1070000052000001 -4 01000002 -5 APP -6 0003004000000000 -A 0001000000000000 -e xpad.prx xpad.sprx
+	# scetool signing options:
+	#   -0 SELF          : SCE file type
+	#   -1 TRUE          : compress data
+	#   -s FALSE         : skip sections
+	#   -2 1C            : appldr revision 001C; OpenSCETool does not accept scetool's 04 shorthand
+	#   -3 1070000052000001 : auth ID
+	#   -4 01000002      : vendor ID
+	#   -5 APP           : SELF type
+	#   -6 0003004000000000 : FW version (3.40)
+	#   -A 0001000000000000 : app version (1.0)
+	/opt/oscetool/oscetool -0 SELF -1 TRUE -s FALSE -2 1C -3 1070000052000001 -4 01000002 -5 APP -6 0003004000000000 -A 0001000000000000 -e xpad.prx xpad.sprx
 
 include $(CELL_MK_DIR)/sdk.target.mk

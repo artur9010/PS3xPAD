@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 
 void *memset(void *m, int c, size_t n)
 {
@@ -199,3 +200,74 @@ size_t strspn(const char *s1, const char *s2)
     return ret;
 }
 
+static void outc(char **dst, size_t *left, int *len, char c)
+{
+    if (*left > 1) {
+        **dst = c;
+        (*dst)++;
+        (*left)--;
+    }
+    (*len)++;
+}
+
+static void outs(char **dst, size_t *left, int *len, const char *s)
+{
+    if (!s) s = "";
+    while (*s) outc(dst, left, len, *s++);
+}
+
+static void outu(char **dst, size_t *left, int *len, unsigned int v, unsigned int base, int width, int zero)
+{
+    char tmp[16];
+    int n = 0;
+
+    do {
+        unsigned int d = v % base;
+        tmp[n++] = (char)(d < 10 ? '0' + d : 'a' + d - 10);
+        v /= base;
+    } while (v);
+    while (n < width) tmp[n++] = zero ? '0' : ' ';
+    while (n) outc(dst, left, len, tmp[--n]);
+}
+
+int snprintf(char *str, size_t size, const char *fmt, ...)
+{
+    va_list ap;
+    char *dst = str;
+    size_t left = size;
+    int len = 0;
+
+    va_start(ap, fmt);
+    while (*fmt) {
+        if (*fmt != '%') {
+            outc(&dst, &left, &len, *fmt++);
+            continue;
+        }
+        fmt++;
+        if (*fmt == '0') fmt++;
+        if (*fmt == '4') fmt++;
+        switch (*fmt++) {
+        case 's':
+            outs(&dst, &left, &len, va_arg(ap, const char *));
+            break;
+        case 'd': {
+            int v = va_arg(ap, int);
+            if (v < 0) {
+                outc(&dst, &left, &len, '-');
+                v = -v;
+            }
+            outu(&dst, &left, &len, (unsigned int)v, 10, 0, 0);
+            break;
+        }
+        case 'x':
+            outu(&dst, &left, &len, va_arg(ap, unsigned int), 16, 4, 1);
+            break;
+        case '%':
+            outc(&dst, &left, &len, '%');
+            break;
+        }
+    }
+    va_end(ap);
+    if (size) *dst = 0;
+    return len;
+}

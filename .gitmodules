@@ -1,0 +1,9 @@
+[submodule "ext_sources/dualsense"]
+	path = ext_sources/dualsense
+	url = https://github.com/nondebug/dualsense
+[submodule "ext_sources/ps3keys"]
+	path = ext_sources/ps3keys
+	url = https://github.com/codyps/ps3keys.git
+[submodule "ext_sources/oscetool"]
+	path = ext_sources/oscetool
+	url = https://github.com/spacemanspiff/oscetool.git

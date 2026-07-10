@@ -1,0 +1,14 @@
+src/*.o
+src/*.elf
+src/*.prx
+src/*.sprx
+src/objs/
+
+# Sony PS3 SDK - leaked proprietary content, do not commit
+sdk/
+*.tar.gz
+*.iso
+*.pkg
+*.rar
+
+ext_sources/oscetool/.git

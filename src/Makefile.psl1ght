@@ -1,0 +1,90 @@
+ifeq ($(strip $(PS3DEV)),)
+PS3DEV := /usr/local/ps3dev
+endif
+
+ifeq ($(strip $(PSL1GHT)),)
+PSL1GHT := $(PS3DEV)/psl1ght
+endif
+
+# Path to webMAN-MOD VSH export stubs (from aldostools/webMAN-MOD/lib)
+# These are reverse-engineered stub libraries that allow PSL1GHT-compiled
+# plugins to call VSH functions (vshtask_notify, etc.) without the leaked
+# Sony SDK. They are the only known open-source way to build VSH plugins.
+WEBMAN_LIB := $(abspath $(CURDIR)/../ext_sources/webman_lib)
+
+PATH := $(PS3DEV)/bin:$(PS3DEV)/ppu/bin:$(PATH)
+
+CC := ppu-gcc
+STRIP := ppu-strip
+SPRX := sprxlinker
+SCE := scetool
+FSELF := fself
+CRT := $(PS3DEV)/ppu/ppu/lib/lv2-sprx.o
+
+TARGET := xpad
+SRCS := libc.c main.c
+OBJS := $(SRCS:.c=.o)
+
+CFLAGS := -DUSE_PSL1GHT -I$(PSL1GHT)/ppu/include -O2 -ffunction-sections -fdata-sections -fno-builtin-printf -std=gnu99 -Wno-shadow -Wno-unused-parameter
+
+# Linker flags: use PSL1GHT linker script for PRX-compatible output,
+# but link against webMAN-MOD VSH export stubs (instead of PSL1GHT's
+# system library stubs) so we can call VSH functions.
+LDFLAGS := -nostartfiles -T$(PS3DEV)/ppu/ppu/lib/lv2.ld -Wl,-e,module_start -Wl,--gc-sections -L$(PSL1GHT)/ppu/lib -L$(WEBMAN_LIB)
+
+# Libraries: webMAN-MOD VSH export stubs + PSL1GHT runtime.
+# The VSH export stubs provide the symbols for VSH functions.
+# The runtime provides basic libc support.
+LIBS := \
+	-lvsh_export_stub \
+	-lvshtask_export_stub \
+	-lvshcommon_export_stub \
+	-lvshmain_export_stub \
+	-lvshnet_export_stub \
+	-lsysPrxForUser_export_stub \
+	-lsys_io_export_stub \
+	-lsys_net_export_stub \
+	-lnetctl_main_export_stub \
+	-lstdc_export_stub \
+	-lsdk_export_stub \
+	-lpaf_export_stub \
+	-lx3_export_stub \
+	-lxsetting_export_stub \
+	-lsysmodule \
+	-lio \
+	-lusb \
+	-llv2 \
+	-lrt
+
+# scetool signing options matching the original Sony SDK build of xpad:
+#   -0 SELF -1 TRUE -s FALSE -2 00 -3 1070000052000001
+#   -4 01000002 -5 APP -6 0003004000000000 -A 0001000000000000
+# Using revision 00 (codyps keys only have 00/01).
+# For FW 4.90 we'd ideally use revision 0A but those keys aren't public.
+# -p 00340001: OpenSCETool's FixELF-style patch (sets sys_process_param SDK version)
+SCEFLAGS := -p 00340001 -0 SELF -1 TRUE -s FALSE -2 00 -3 1070000052000001 -4 01000002 -5 APP -6 0003004000000000 -A 0001000000000000
+
+.PHONY: all clean
+
+all: $(TARGET).sprx
+
+$(TARGET).elf: $(OBJS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(CRT) $^ $(LIBS)
+
+$(TARGET).sprx: $(TARGET).elf
+	cp $< $(TARGET).linked.elf
+	$(STRIP) $(TARGET).linked.elf
+	$(SPRX) $(TARGET).linked.elf
+	# Patch ELF type to PRX (0xFFA4) at offset 16
+	printf '\xff\xa4' | dd of=$(TARGET).linked.elf bs=1 seek=16 conv=notrunc status=none
+	# Zero out section headers (PRX format has no sections)
+	printf '\000\000\000\000\000\000\000\000' | dd of=$(TARGET).linked.elf bs=1 seek=40 conv=notrunc status=none
+	printf '\000\000' | dd of=$(TARGET).linked.elf bs=1 seek=58 conv=notrunc status=none
+	printf '\000\000' | dd of=$(TARGET).linked.elf bs=1 seek=60 conv=notrunc status=none
+	$(SCE) $(SCEFLAGS) -e $(TARGET).linked.elf $@
+
+clean:
+	rm -f $(OBJS) $(TARGET).elf $(TARGET).linked.elf $(TARGET).sprx
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c -o $@ $<

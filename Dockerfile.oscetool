@@ -1,0 +1,20 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        gdb \
+        zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/oscetool
+COPY ext_sources/oscetool/ ./
+
+RUN make clean \
+    && make CFLAGS='-g -O0 -Wall -W'
+
+WORKDIR /work
+ENTRYPOINT ["/bin/bash"]

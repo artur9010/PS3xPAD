@@ -1,0 +1,52 @@
+FROM ubuntu:26.04
+
+ARG BUILD_JOBS=12
+# Sony PS3 SDK 4.00 paths
+ENV CELL_SDK=/sdk/cell
+ENV PATH=${CELL_SDK}/host-win32/ppu/bin:${CELL_SDK}/host-win32/bin:${CELL_SDK}/host-win32/sn/bin:$PATH
+ENV WINEDEBUG=-all
+ENV WINEPREFIX=/root/.wine
+ENV PS3=/data
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN dpkg --add-architecture i386 && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        wine \
+        wine32:i386 \
+        wine64 \
+        mingw-w64 \
+        mingw-w64-tools \
+        mingw-w64-x86-64-dev \
+        gcc \
+        make \
+        zlib1g-dev \
+        python3 \
+        python-is-python3 \
+        p7zip-full \
+        curl \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /work
+COPY . /work
+
+RUN make -C /work/ext_sources/oscetool clean \
+    && make -C /work/ext_sources/oscetool CFLAGS='-O2 -Wall -W' \
+    && mkdir -p /opt/oscetool \
+    && cp /work/ext_sources/oscetool/oscetool /opt/oscetool/oscetool
+
+# Copy Sony SDK 4.00 into the image
+COPY sdk/ /sdk/
+
+# Install 4.55 keys to /data (scetool convention)
+RUN mkdir -p /data && cp /sdk/keys/keys /data/keys 2>/dev/null || \
+    echo "WARNING: No keys file found"
+
+RUN cp /work/ext_sources/ps3keys/curves /data/ldr_curves 2>/dev/null || \
+    echo "WARNING: No loader curves file found"
+
+# Build the plugin
+RUN bash /work/scripts/build_sony_docker.sh
+
+CMD ["bash", "/work/scripts/build_sony_docker.sh"]

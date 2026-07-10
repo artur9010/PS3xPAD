@@ -1,0 +1,23 @@
+# Docker Compose for building PS3xPAD with the leaked Sony PS3 SDK 475.001
+#
+# Usage:
+#   1. Place your PS3 SDK at one of:
+#      - ./sdk/PS3_SDK.tar.gz (tarball of extracted SDK)
+#      - ./sdk/cell/ (already extracted SDK directory)
+#      - ./sdk/PS3_4.75_SDK_Offline_Installer.rar (original RAR)
+#   2. Run: docker compose up
+#   3. Find xpad.sprx in ./src/
+
+services:
+  build:
+    build:
+      context: .
+      dockerfile: Dockerfile.sony
+      args:
+        BUILD_JOBS: 12
+    volumes:
+      # Mount the SDK directory
+      - ./sdk:/sdk
+      # Mount the project for live builds
+      - .:/work
+    working_dir: /work

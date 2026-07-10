@@ -1,0 +1,14 @@
+.git
+releases
+ext_sources/dualsense/.git
+ext_sources/oscetool/.git
+src/*.o
+src/*.elf
+src/*.prx
+src/*.sprx
+src/objs/
+*.tar.gz
+*.iso
+*.pkg
+*.rar
+# Note: sdk/ is NOT excluded - we need it for the Sony SDK build

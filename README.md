@@ -1,6 +1,17 @@
 # PS3xPAD Plugin by OsirisX
 A PS3 plugin by OsirisX, that allows using many unsupported Controllers (XBOX,PS4 and others)
 
+## LLM WARNING
+
+Codex (GPT-5.5/medium) + Z.ai (GLM-5.2 after i ran out of codex) was there and helped with adding support for DS5. You have been warned.
+It used https://github.com/nondebug/dualsense and linux dualsense module as reference.
+
+Also tried with porting it to psl1ight instead of sony propertiary shit, but looks like it can't produce loadable plugin. It just refuses to download it and i dont know how to debug that.
+
+So... go find yourself a `ps3_sdk_400-PS3_4.00_SDK-YLoD.7z`, it's on archive.org
+
+## END OF WARNING
+
 Link: https://www.psx-place.com/resources/ps3xpad.22/
 
 I intended on adding a couple more features into this release but would have added more delay.

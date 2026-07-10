@@ -7,6 +7,7 @@
 0x046d, 0xc242, Logitech Chillstream Controller, XTYPE_XBOX360
 0x054c, 0x0268, Sony Playstation DualShock 3, PTYPE_PS3
 0x054c, 0x05c4, Sony Playstation DualShock 4, PTYPE_PS4
+0x054c, 0x0ce6, Sony DualSense Wireless Controller, XTYPE_DUALSENSE
 0x0738, 0x4716, Mad Catz Wired Xbox 360 Controller, XTYPE_XBOX360
 0x0738, 0x4728, Mad Catz Street Fighter IV FightPad, XTYPE_XBOX360
 0x0738, 0x4738, Mad Catz Wired Xbox 360 Controller (SFIV), XTYPE_XBOX360

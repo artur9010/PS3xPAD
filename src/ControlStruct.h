@@ -61,6 +61,20 @@ typedef struct XBOX360W_IN_REPORT {
     XBox360_Byte reserved;
 } PACKED XBOX360W_IN_REPORT;
 
+// DualSense USB input report 0x01, including report id.
+typedef struct DUALSENSE_USB_IN_REPORT {
+    XBox360_Byte report_id;
+    XBox360_Byte lx, ly;
+    XBox360_Byte rx, ry;
+    XBox360_Byte l2, r2;
+    XBox360_Byte seq;
+    XBox360_Byte buttons0;
+    XBox360_Byte buttons1;
+    XBox360_Byte buttons2;
+    XBox360_Byte buttons3;
+    XBox360_Byte reserved[52];
+} PACKED DUALSENSE_USB_IN_REPORT;
+
 // Structure describing the command to change LED status
 typedef struct XBOX360_OUT_LED {
     XBOX360_PACKET header;
@@ -102,6 +116,27 @@ enum ButtonBits {
     btnXbox          = 0x0004,
     btnShoulderRight = 0x0002,
     btnShoulderLeft  = 0x0001
+};
+
+enum DualSenseButtonBits {
+    dsBtnHat      = 0x0f,
+    dsBtnSquare   = 0x10,
+    dsBtnCross    = 0x20,
+    dsBtnCircle   = 0x40,
+    dsBtnTriangle = 0x80,
+
+    dsBtnL1       = 0x01,
+    dsBtnR1       = 0x02,
+    dsBtnL2       = 0x04,
+    dsBtnR2       = 0x08,
+    dsBtnCreate   = 0x10,
+    dsBtnOptions  = 0x20,
+    dsBtnL3       = 0x40,
+    dsBtnR3       = 0x80,
+
+    dsBtnPS       = 0x01,
+    dsBtnTouchpad = 0x02,
+    dsBtnMute     = 0x04
 };
 
 // LED values
