@@ -102,21 +102,30 @@ The original `src/Makefile` uses Sony SDK 4.00 with:
 - A valid PRX now builds at `src/xpad.prx` (about 23K stripped) using Sony SDK 4.00 Windows GCC via Wine, SDK 4.00 headers/libs, and SDK 1.92 `samples/mk` makefile rules. Key trick: avoid Sony `libc.a` entirely and provide a tiny local `snprintf` in `src/libc.c`; linking full `libc.a` pulls CRT objects that trigger `.sys_proc_prx_param` fixup errors.
 - `src/xpad.sprx` can be produced with SDK 1.92 Linux `make_fself` under `ubuntu:18.04` with `libstdc++5:i386`, but this is fake-signed and may not load as a VSH plugin.
 - `oscetool` from `spacemanspiff/oscetool` builds in `Dockerfile.oscetool` and can sign/re-read `src/xpad.prx` when run with `-2 1C` and a data dir containing `keys` plus `ldr_curves` copied from `ext_sources/ps3keys/curves`. The earlier segfault was a missing `ldr_curves` file, not PRX parsing: `ec.c` indexed `loader_curves[0x09]` while `loader_curves` was NULL.
+- `ext_sources/webman_lib/libvshtask_export_stub.a` provides Sony SDK-compatible export stub for VSH notification (`vshtask_A02D46E7`). Linking this at build time is more reliable than the runtime `getNIDfunc` table scan, which depends on hardcoded VSH table addresses that differ across firmware versions.
 - `Dockerfile.sony` now builds `oscetool`, copies `ext_sources/ps3keys/curves` to `/data/ldr_curves`, builds `xpad.prx` through SDK 1.92 make fragments with SDK 4.00 Wine tools, strips it, then signs `xpad.sprx` with `oscetool -2 1C`. Verified by running `podman run --rm -v "$PWD:/work" ps3xpad-sony` and reading the output with `oscetool -i`: key revision `0x001C`, SELF type APP, ELF type SPRX, 3 program headers.
 - Sony SDK PRX link flow is documented in `$CELL_SDK/target/ppu/lib/prxspec.4.1.1`: start files are `ecrti.o prx_crt.o crtbegin.o`, end files are `crtend.o ecrtn.o`, PRX prelink uses `prx32.xr`, and fixup uses `ppu-lv2-prx-fixup`.
 
 ### Current blocker
-- Need PS3 validation of the `oscetool`-signed SPRX. OpenSCETool uses actual appldr revision `-2 1C`; original scetool shorthand `-2 04` still fails with `Could not find keyset for SELF`.
-- Original scetool command metadata for comparison: `scetool -0 SELF -1 TRUE -s FALSE -2 04 -3 1070000052000001 -4 01000002 -5 APP -6 0003004000000000 -A 0001000000000000 -e src/xpad.prx src/xpad.sprx`.
+- None — DualSense fully working (input, XMB, PS button).
 
-### Next best build path
-1. Keep the current no-`libc.a` PRX build path; it produces `src/xpad.prx` successfully.
-2. Generate an `oscetool` SPRX in a container using `-2 1C` and `ldr_curves`, then test it on PS3/WebMAN.
-3. If `oscetool` output fails on PS3, compare against original `scetool` output or find the original signer.
+### What's working (DualSense-specific)
+- DualSense controller works on PS3 4.90 EvilNat CFW via USB — XMB navigation, PS button, and all game buttons (cross, circle, square, triangle, D-pad, L1/R1/L2/R2, L3/R3, options, create, analog sticks, touchpad click).
+- PS button works on XMB (via LDD `cellPadLddDataInsert` — XMB polls the LDD inserted data and routes PS button to the system menu).
+- Key fix: added `cellUsbdControlTransfer` with SET_IDLE (bmRequestType=0x21, bRequest=0x0A, wValue=0) in `dualsense_set_config_done` before starting data transfers. Without this, the DualSense never sends interrupt IN data.
+- VSH notifications now work via Sony SDK import stub (`libvshtask_export_stub.a` from webMAN-MOD): `show_msg` calls `vshtask_A02D46E7` directly, resolved at PRX load time instead of the runtime `getNIDfunc` table scan.
+- Messages from USB callback context (attach/detach notifications) are queued in a ring buffer and flushed from the polling thread (`xpadd_thread`) where `vshtask_A02D46E7` context is valid.
+- **HID interface scan fix:** `dualsense_attach` now scans for `bInterfaceClass == 0x03` (HID) instead of always using the first interface. The DualSense has 4 interfaces (0-2 audio, 3 HID); previously the endpoint scan picked the isochronous IN endpoint (0x82, 196 bytes) from the audio interface instead of the HID interrupt IN endpoint (0x84, 64 bytes).
+- **Interrupt endpoint filter:** endpoint scan also checks `bmAttributes == 0x03` (interrupt type) to avoid matching isochronous endpoints.
+- **Multi-interface dedup:** `dualsense_attach` checks for an existing `XTYPE_DUALSENSE` unit in `XPAD.con_unit` before registering — prevents duplicate LDD registration when USB stack calls attach for multiple interfaces of the same device.
+
+### Known issues
+- Oscetool outputs benign warnings `[*] Error: unknown SELF type 'SEVEN'` and `[*] Warning: Could not load loader curves` during signing; the SPRX still loads fine on PS3.
+- DualSense output reports (LED, rumble) are not yet implemented — `dualsense_set_led` and `dualsense_set_rumble` are stubs returning CELL_OK.
 
 ## How to test on PS3
 
-1. Build `src/xpad.sprx` (currently failing, need to fix wine issue)
+1. Build `src/xpad.sprx` via `podman run --rm -v "$PWD:/work" ps3xpad-sony` (or `Dockerfile.sony`)
 2. Copy to PS3: `curl -T src/xpad.sprx ftp://192.168.1.128/dev_hdd0/plugins/xpad.sprx`
 3. Verify it's not loaded: `curl http://192.168.1.128/vshplugin.ps3mapi` (slot 2 should be NULL)
 4. Load manually: `curl "http://192.168.1.128/loadprx.ps3?slot=2&prx=/dev_hdd0/plugins/xpad.sprx"`
@@ -134,6 +143,9 @@ The original `src/Makefile` uses Sony SDK 4.00 with:
 ## PS3 validation log
 
 - 2026-07-10: `src/xpad.sprx` built by `Dockerfile.sony` with SDK 4.00 Wine tools + `oscetool -2 1C` was uploaded to `/dev_hdd0/plugins/xpad.sprx` and loaded via `http://192.168.1.128/loadprx.ps3?slot=2&prx=/dev_hdd0/plugins/xpad.sprx`. WebMAN VSH plugin page showed slot 2 loaded as `XPADD`, confirming Cobra/WebMAN accepts this signed SPRX.
+- 2026-07-10: **DualSense input confirmed working** after SET_IDLE fix. Added `cellUsbdControlTransfer` with HID request 0x0A (SET_IDLE) in init chain to wake up DualSense HID data streaming. Without SET_IDLE, the DualSense never sends interrupt IN data. Root cause: PS3 USB stack doesn't send HID class requests when an LDD replaces the HID driver.
+- 2026-07-10: **DualSense XMB navigation and PS button working** after HID interface scan fix. Root cause: `dualsense_attach` always scanned the first USB interface (audio, class 0x01) instead of the HID interface (class 0x03), picking the isochronous IN endpoint (0x82, 196 bytes) from the audio streaming interface instead of the HID interrupt IN endpoint (0x84, 64 bytes). Fix: scan for `bInterfaceClass == 0x03`, also filter `bmAttributes == 0x03` to ensure interrupt-type endpoints. Also fixed: notification ring buffer for USB callback context messages, duplicate LDD registration guard via `XTYPE_DUALSENSE` check.
+- 2026-07-10: **Notifications from USB attach/detach callbacks working** via ring buffer queued in callback context and flushed from polling thread.
 
 ## Files in /home/artur9010/ (SDK sources)
 
@@ -168,3 +180,7 @@ The original `xpad_vsh.sprx` from `/releases/ps3xpad_0.8.zip` works on this PS3 
 ## Recommendation for the next agent
 
 The most pragmatic next step is to produce `src/xpad.sprx` with container-built `oscetool` using actual key revision `-2 1C`, deploy it to PS3, and verify whether Cobra/webMAN loads it.
+
+Key finding: DualSense requires SET_IDLE control transfer (HID bmRequestType=0x21, bRequest=0x0A) before interrupt IN transfers will stream data. The PS3 USB stack (unlike Linux/macOS) does not automatically send HID class requests when an LDD replaces the built-in driver — the LDD must explicitly send SET_IDLE to wake up the DualSense HID endpoint.
+
+Key finding: DualSense has 4 USB interfaces (0-2 audio, 3 HID). The LDD `attach` callback is called for each interface the LDD claims (per-device VID/PID match). The original `cellUsbdScanStaticDescriptor` pattern of "start from first interface" only works for single-interface devices. For multi-interface devices, you must scan for the correct interface class (`bInterfaceClass == 0x03` for HID) and filter endpoint type (`bmAttributes == 0x03` for interrupt). Also guard duplicate LDD registrations by checking for existing `XTYPE_DUALSENSE` in `XPAD.con_unit`.

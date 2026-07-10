@@ -27,6 +27,7 @@ PPU_PRX_STRIPFLAGS += --strip-debug --strip-section-header
 PPU_INCDIRS += -I$(CELL_TARGET_PATH)/ppu/include/cell/net
 PPU_SRCS = libc.c main.c
 PPU_LIBS += $(CELL_TARGET_PATH)/ppu/lib/libusbd_stub.a $(CELL_TARGET_PATH)/ppu/lib/libio_stub.a $(CELL_TARGET_PATH)/ppu/lib/libfs_stub.a
+PPU_LIBS += ../ext_sources/webman_lib/libvshtask_export_stub.a
 PPU_PRX_TARGET = xpad.prx
 
 CLEANFILES = $(PRX_DIR)/$(PPU_SPRX_TARGET)

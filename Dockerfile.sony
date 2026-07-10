@@ -1,6 +1,10 @@
 FROM ubuntu:26.04
 
 ARG BUILD_JOBS=12
+
+# Copy SDK early for layer caching
+COPY sdk/ /sdk/
+
 # Sony PS3 SDK 4.00 paths
 ENV CELL_SDK=/sdk/cell
 ENV PATH=${CELL_SDK}/host-win32/ppu/bin:${CELL_SDK}/host-win32/bin:${CELL_SDK}/host-win32/sn/bin:$PATH
@@ -36,8 +40,7 @@ RUN make -C /work/ext_sources/oscetool clean \
     && mkdir -p /opt/oscetool \
     && cp /work/ext_sources/oscetool/oscetool /opt/oscetool/oscetool
 
-# Copy Sony SDK 4.00 into the image
-COPY sdk/ /sdk/
+
 
 # Install 4.55 keys to /data (scetool convention)
 RUN mkdir -p /data && cp /sdk/keys/keys /data/keys 2>/dev/null || \
