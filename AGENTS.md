@@ -121,17 +121,16 @@ The original `src/Makefile` uses Sony SDK 4.00 with:
 
 ### Known issues
 - Oscetool outputs benign warnings `[*] Error: unknown SELF type 'SEVEN'` and `[*] Warning: Could not load loader curves` during signing; the SPRX still loads fine on PS3.
-- DualSense output reports (LED, rumble) are not yet implemented — `dualsense_set_led` and `dualsense_set_rumble` are stubs returning CELL_OK.
+- DualSense output reports (rumble) are not yet implemented — `dualsense_set_rumble` is a stub returning CELL_OK.
+- DualSense LED is now implemented (green on connect via interrupt OUT pipe).
 
 ## How to test on PS3
 
 1. Build `src/xpad.sprx` via `podman run --rm -v "$PWD:/work" ps3xpad-sony` (or `Dockerfile.sony`)
 2. Copy to PS3: `curl -T src/xpad.sprx ftp://192.168.1.128/dev_hdd0/plugins/xpad.sprx`
-3. Verify it's not loaded: `curl http://192.168.1.128/vshplugin.ps3mapi` (slot 2 should be NULL)
-4. Load manually: `curl "http://192.168.1.128/loadprx.ps3?slot=2&prx=/dev_hdd0/plugins/xpad.sprx"`
-5. Check it loaded: `curl http://192.168.1.128/vshplugin.ps3mapi` (slot 2 should show "XPADD" if it worked)
-6. Add to boot plugins: `curl -T boot_plugins.txt ftp://192.168.1.128/dev_hdd0/boot_plugins.txt`
-7. Or use webMAN UI to load it
+3. Reboot PS3 via `curl http://192.168.1.128/restart.ps3` (plugin reload via webMAN doesn't fully reinitialize — reboot required)
+4. After reboot, verify it loaded: `curl http://192.168.1.128/vshplugin.ps3mapi` (slot 2 should show "XPADD")
+5. Add to boot plugins: `curl -T boot_plugins.txt ftp://192.168.1.128/dev_hdd0/boot_plugins.txt`
 
 ## Important URLs
 

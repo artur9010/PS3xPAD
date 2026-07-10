@@ -1149,7 +1149,7 @@ static int32_t dualsense_attach(int32_t dev_id) {
   UsbDeviceDescriptor *ddesc;
   UsbConfigurationDescriptor *cdesc;
   UsbInterfaceDescriptor *idesc;
-  UsbEndpointDescriptor *edesc;
+  UsbEndpointDescriptor *i_edesc, *o_edesc;
   XPAD_UNIT_t *unit;
 
   if ((ddesc = (UsbDeviceDescriptor *)cellUsbdScanStaticDescriptor(dev_id, NULL, USB_DESCRIPTOR_TYPE_DEVICE)) != NULL) {
@@ -1168,17 +1168,28 @@ static int32_t dualsense_attach(int32_t dev_id) {
   if (idesc == NULL) {
     return(CELL_USBD_ATTACH_FAILED);
   }
-  edesc = (UsbEndpointDescriptor *)idesc;
-  while ((edesc = (UsbEndpointDescriptor *) cellUsbdScanStaticDescriptor(dev_id, edesc, USB_DESCRIPTOR_TYPE_ENDPOINT)) != NULL) {
-    if ((edesc->bEndpointAddress & 0x80) && edesc->bmAttributes == 0x03) {
+
+  i_edesc = (UsbEndpointDescriptor *)idesc;
+  while ((i_edesc = (UsbEndpointDescriptor *) cellUsbdScanStaticDescriptor(dev_id, i_edesc, USB_DESCRIPTOR_TYPE_ENDPOINT)) != NULL) {
+    if ((i_edesc->bEndpointAddress & 0x80) && i_edesc->bmAttributes == 0x03) {
       break;
     }
   }
-  if (edesc == NULL) {
+  if (i_edesc == NULL) {
     return(CELL_USBD_ATTACH_FAILED);
   }
-  payload = SWAP16(edesc->wMaxPacketSize);
+  payload = SWAP16(i_edesc->wMaxPacketSize);
   if (payload < sizeof(DUALSENSE_USB_IN_REPORT)) {
+    return(CELL_USBD_ATTACH_FAILED);
+  }
+
+  o_edesc = (UsbEndpointDescriptor *)idesc;
+  while ((o_edesc = (UsbEndpointDescriptor *) cellUsbdScanStaticDescriptor(dev_id, o_edesc, USB_DESCRIPTOR_TYPE_ENDPOINT)) != NULL) {
+    if (!(o_edesc->bEndpointAddress & 0x80) && o_edesc->bmAttributes == 0x03) {
+      break;
+    }
+  }
+  if (o_edesc == NULL) {
     return(CELL_USBD_ATTACH_FAILED);
   }
 
@@ -1198,7 +1209,11 @@ static int32_t dualsense_attach(int32_t dev_id) {
     unit_free(unit);
     return(CELL_USBD_ATTACH_FAILED);
   }
-  if ((unit->i_pipe = cellUsbdOpenPipe(dev_id, edesc)) < 0) {
+  if ((unit->i_pipe = cellUsbdOpenPipe(dev_id, i_edesc)) < 0) {
+    unit_free(unit);
+    return(CELL_USBD_ATTACH_FAILED);
+  }
+  if ((unit->o_pipe = cellUsbdOpenPipe(dev_id, o_edesc)) < 0) {
     unit_free(unit);
     return(CELL_USBD_ATTACH_FAILED);
   }
@@ -1347,7 +1362,23 @@ static int32_t dualsense_read_input(int32_t id, void *data) {
 }
 
 static int32_t dualsense_set_led(int32_t id, uint8_t led) {
-  return(CELL_OK);
+  XPAD_UNIT_t *unit;
+  uint8_t report[48];
+  (void)led;
+
+  unit = XPAD.con_unit[id];
+  if (unit == NULL) return(-1);
+
+  memset(report, 0, sizeof(report));
+  report[0] = 0x02;          // report_id
+  report[1] = 0xFF;          // valid_flag0: enable all
+  report[2] = 0x04;          // valid_flag1: lightbar control enable
+  report[39] = 0x02;         // valid_flag2: lightbar setup control enable
+  report[42] = 0x02;         // lightbar_setup: enable LEDs
+  report[43] = 0xFF;         // led_brightness: max
+  report[45] = 0x00; report[46] = 0xFF; report[47] = 0x00; // R G B = green
+
+  return(cellUsbdInterruptTransfer(unit->o_pipe, report, sizeof(report), usb_done_cb, unit));
 }
 
 static int32_t dualsense_set_rumble(int32_t id, uint8_t lval, uint8_t rval) {
