@@ -106,8 +106,9 @@ The original `src/Makefile` uses Sony SDK 4.00 with:
 - `Dockerfile.sony` now builds `oscetool`, copies `ext_sources/ps3keys/curves` to `/data/ldr_curves`, builds `xpad.prx` through SDK 1.92 make fragments with SDK 4.00 Wine tools, strips it, then signs `xpad.sprx` with `oscetool -2 1C`. Verified by running `podman run --rm -v "$PWD:/work" ps3xpad-sony` and reading the output with `oscetool -i`: key revision `0x001C`, SELF type APP, ELF type SPRX, 3 program headers.
 - Sony SDK PRX link flow is documented in `$CELL_SDK/target/ppu/lib/prxspec.4.1.1`: start files are `ecrti.o prx_crt.o crtbegin.o`, end files are `crtend.o ecrtn.o`, PRX prelink uses `prx32.xr`, and fixup uses `ppu-lv2-prx-fixup`.
 
-### Current blocker
-- None — DualSense fully working (input, XMB, PS button).
+### Current blockers
+- **PS3 crashed (boot failure)** — wrong LV2_OFFSET_ON_LV1 (0x8000000) passed to syscall 8 caused hypervisor fault. Console power-cycles at boot animation. Needs safe mode recovery.
+- GTA V / Soul Calibur 5 don't receive input despite working on XMB and most games (Minecraft confirmed). Game detects controller (shows "controller disconnected" notification) but ignores button data. Root cause: `cellPadGetInfo2` returns `device_type[port] = 5` (LDD) instead of 0 (STANDARD), and GTA V explicitly checks this and skips input for non-standard controllers.
 
 ### What's working (DualSense-specific)
 - DualSense controller works on PS3 4.90 EvilNat CFW via USB — XMB navigation, PS button, and all game buttons (cross, circle, square, triangle, D-pad, L1/R1/L2/R2, L3/R3, options, create, analog sticks, touchpad click).
@@ -146,6 +147,10 @@ The original `src/Makefile` uses Sony SDK 4.00 with:
 - 2026-07-10: **DualSense XMB navigation and PS button working** after HID interface scan fix. Root cause: `dualsense_attach` always scanned the first USB interface (audio, class 0x01) instead of the HID interface (class 0x03), picking the isochronous IN endpoint (0x82, 196 bytes) from the audio streaming interface instead of the HID interrupt IN endpoint (0x84, 64 bytes). Fix: scan for `bInterfaceClass == 0x03`, also filter `bmAttributes == 0x03` to ensure interrupt-type endpoints. Also fixed: notification ring buffer for USB callback context messages, duplicate LDD registration guard via `XTYPE_DUALSENSE` check.
 - 2026-07-10: **Notifications from USB attach/detach callbacks working** via ring buffer queued in callback context and flushed from polling thread.
 
+- 2026-07-10: **Game module built and PS3MAPI auto-loading implemented**. `xpad_game.sprx` (2263 bytes) registers LDD from game context via syscall 574. VSH module scans all processes every ~2.5s, loads game module into any non-system process. Uploaded and rebooted PS3 — `XPADD` loaded in slot 2.
+- 2026-07-10: **PS3MAPI causes kernel panic on EvilNat 4.90** — calling syscall 8 with opcode 0x7777 (any PS3MAPI sub-opcode) freezes console. Hard reset required. Game module reduced to no-op. `addr=0` in syscall 574 also breaks LDD registration (needs `5`).
+- 2026-07-10: **GTA V diagnosis completed**. LDD controller confirmed on port 0. GTA V detects controller (disconnect notification works) but ignores button data. `data.len=64` and `button[1]=0xFF` tested — no effect. Root cause: `device_type = 5` (LDD) in `cellPadGetInfo2`. Game need compatibility hooks installed in its process.
+
 ## Files in /home/artur9010/ (SDK sources)
 
 - `ps3_sdk_400-PS3_4.00_SDK-YLoD.7z` (2.1GB) - SDK 4.00 with PS3_Toolchain_411-Win_400_001.zip (Windows tools)
@@ -183,3 +188,260 @@ The most pragmatic next step is to produce `src/xpad.sprx` with container-built 
 Key finding: DualSense requires SET_IDLE control transfer (HID bmRequestType=0x21, bRequest=0x0A) before interrupt IN transfers will stream data. The PS3 USB stack (unlike Linux/macOS) does not automatically send HID class requests when an LDD replaces the built-in driver — the LDD must explicitly send SET_IDLE to wake up the DualSense HID endpoint.
 
 Key finding: DualSense has 4 USB interfaces (0-2 audio, 3 HID). The LDD `attach` callback is called for each interface the LDD claims (per-device VID/PID match). The original `cellUsbdScanStaticDescriptor` pattern of "start from first interface" only works for single-interface devices. For multi-interface devices, you must scan for the correct interface class (`bInterfaceClass == 0x03` for HID) and filter endpoint type (`bmAttributes == 0x03` for interrupt). Also guard duplicate LDD registrations by checking for existing `XTYPE_DUALSENSE` in `XPAD.con_unit`.
+
+## Game compatibility research (2026-07-10)
+
+### Why GTA V and Soul Calibur 5 don't get DualSense input
+
+**Bottom line:** LDD data IS visible to game processes (confirmed: GTA V shows "controller disconnected" notification when unplugging DualSense). The LDD controller is on port 0 (confirmed via notification "XPAD ldd port unit:0 port:0"). Input data is inserted correctly (len=64, button[1]=0xFF, all appropriate flags set). GTA V **explicitly checks `device_type[port]`** in `cellPadGetInfo2` — LDD controllers report `device_type = 5` (CELL_PAD_DEV_TYPE_LDD) instead of `0` (STANDARD). GTA V skips input for non-standard controllers.
+
+**Confirmed facts (2026-07-10 session):**
+
+1. **LDD port is port 0** — `cellPadLddGetPortNo` returns 0. "unit:0 port:0" from notification.
+2. **GTA V detects controller** — unplugging DualSense shows "controller disconnected" overlay in GTA V. This means `cellPadGetInfo2.port_status[0]` correctly reports CONNECTED, and game monitors port status.
+3. **GTA V ignores button data** — no response to any button presses or analog stick movement.
+4. **addr=5 is REQUIRED in syscall 574** — `addr=0` breaks LDD registration entirely (no "ldd registered" notification, no controller on XMB). `addr=5` is a type flag, not a port number.
+5. **Capability flags (0xFFFF→0x1F) didn't fix GTA V** — tested, no effect.
+6. **data.len=24 vs data.len=64, button[1]=0xFF didn't fix GTA V** — tested together, no effect.
+7. **PS3MAPI syscall 8 with 0x7777 causes kernel panic** — even though Cobra menu says "syscall 8 is enabled", calling PS3MAPI opcodes (GET_ALL_PROC_PID, LOAD_PROC_MODULE) locks up the PS3 (power button unresponsive, requires hard reset).
+
+**Root cause hypothesis:**
+`cellPadGetInfo2` returns:
+```c
+device_type[port] = CELL_PAD_DEV_TYPE_LDD  // = 5
+```
+GTA V's input processing code checks `device_type[port]` and rejects non-STANDARD (type != 0) controllers. The game sees the controller as connected (port_status) but skips input processing because it's not a standard DS3.
+
+**Fix requirements:**
+Either:
+- **PS3MAPI**: inject game module into game process via Cobra syscall 8 → blocked by kernel panic
+- **LV2 kernel patching**: modify kernel's `device_type` for LDD controllers → needs lv2_poke
+- **EBOOT patching**: patch game's `cellPadGetInfo2` call to accept type 5 → last resort, requires user action
+
+**How PS3MAPI crash manifests:**
+Starting GTA V triggers `check_and_load_game_module()` after ~2.5s. The PS3MAPI calls cause immediate LV2 kernel panic: black screen, unresponsive power button, hard reset required. This happens even though "Cobra syscall 8" is reported as enabled. PS3MAPI sub-opcodes (0x7777 namespace) may be separately blocked or require an access key (`ps3mapi_enable_access_syscall8`). "Check Syscall 8" in Cobra menu only validates that the syscall 8 handler exists, not that PS3MAPI opcodes within it work.
+
+**Alternative write mechanisms to investigate (UPDATED — see session log part 2):**
+EVILNAT 4.90 syscall 6/7 are PS3HEN-only (NOT for CFW). syscall 8 = LV1 peek (CFW), syscall 9 = LV1 poke (CFW). Both require correct LV2_OFFSET_ON_LV1. **Do NOT test syscall 8/9 from VSH plugin — hypervisor fault crashes whole system.** syscall 15/35 unknown.
+
+**CellPadInfo2 structure** (from Sony SDK pad_codes.h):
+```c
+typedef struct CellPadInfo2 {
+    uint32_t max_connect;                     // 7
+    uint32_t now_connect;                     // current connected count
+    uint32_t system_info;
+    uint32_t port_status[CELL_PAD_MAX_PORT_NUM];  // 7 ports
+    uint32_t port_setting[CELL_PAD_MAX_PORT_NUM];
+    uint32_t device_capability[CELL_PAD_MAX_PORT_NUM];
+    uint32_t device_type[CELL_PAD_MAX_PORT_NUM];  // 0=STANDARD, 5=LDD
+} CellPadInfo2;
+```
+
+**CellPadData format verification** (from Sony SDK):
+```c
+typedef struct CellPadData {
+    int32_t len;            // Correct: 24 or 64
+    uint16_t button[64];
+} CellPadData;
+// button[0] = PS button flag (CELL_PAD_CTRL_LDD_PS = 1<<0)
+// button[2] = DIGITAL1: D-pad + Start/Select/L3/R3
+// button[3] = DIGITAL2: Face + L1/R1/L2/R2
+// button[4-7] = Analog sticks (8-bit, center 0x80)
+// button[8-19] = Pressure values (0x00-0xFF)
+// button[20-23] = Motion sensors (0x0200 default)
+```
+
+**Key research findings:**
+
+1. **LDD data IS visible to game processes** — GTA V detects controller connect/disconnect via `cellPadGetInfo2.port_status`. Data format is correct. The block is at the application level.
+
+2. **Original v0.8 two-module architecture:** `xpad_vsh.sprx` (VSH process) + `xpad_game.sprx` (loaded into game process via PS3MAPI). The game module was loaded manually by pressing START+SELECT+R3 in-game, or automatically via auto-detect. Without it, GTA V and Soul Calibur IV/V had no input.
+
+3. **Compatibility mode** (START+SELECT+DPAD_UP) installs hooks in the game process — requires DEX kernel + debug EBOOT. Fixes GTA V, RDR, SC4, SC5 specifically. The hooks patch `cellPadGetData`/`cellPadGetInfo2` in the game process to accept LDD controllers.
+
+4. **Memory constraint:** RouLetteVshMenu research states AAA games (GTA V, RDR) have no free memory for injected SPRX — `GamePatching::StartSprx` will not work. The workaround is patching the EBOOT directly.
+
+5. **PS3MAPI crash confirmed** — calling syscall 8 with opcode 0x7777 and any PS3MAPI sub-opcode causes LV2 kernel panic on this EvilNat 4.90 setup, even with "Cobra syscall 8" enabled.
+
+### SDK capability defines
+
+From `PS3DK/sdk/include/cell/pad.h`:
+```c
+#define CELL_PAD_CAPABILITY_PS3_CONFORMITY   (1 << 0)  // 0x01
+#define CELL_PAD_CAPABILITY_PRESS_MODE       (1 << 1)  // 0x02
+#define CELL_PAD_CAPABILITY_SENSOR_MODE      (1 << 2)  // 0x04
+#define CELL_PAD_CAPABILITY_HP_ANALOG_STICK  (1 << 3)  // 0x08
+#define CELL_PAD_CAPABILITY_ACTUATOR         (1 << 4)  // 0x10
+#define CELL_PAD_DEV_TYPE_STANDARD           0
+#define CELL_PAD_DEV_TYPE_LDD                5
+```
+
+### Syscall signatures (from PSDevWiki)
+
+- Syscall 572: `sys_pad_ldd_data_insert(int32_t handle, cellpaddata* data)` — non-debug version
+- Syscall 573: `sys_pad_dbg_ldd_set_data_insert_mode(int32_t handle, 0x100, uint32_t* mode, 4)` — addr=0x100 always
+- Syscall 574: `sys_pad_ldd_register_controller/sys_pad_dbg_ldd_register_controller(uint8_t[0x114], int32_t* out, 5, uint32_t device_capability<<1)`
+- Syscall 575: `sys_pad_ldd_get_port_no(int32_t handle)`
+
+All available on DECR/DEX/CEX.
+
+### PS3MAPI calling convention (syscall 8, opcode 0x7777)
+
+```c
+// Get all process PIDs: pid_list is uint32_t[16] output array
+system_call_3(8, 0x7777, PS3MAPI_OPCODE_GET_ALL_PROC_PID, (uint64_t)(uint32_t)pid_list);
+
+// Get process name by PID: name is char[32] output buffer
+system_call_4(8, 0x7777, PS3MAPI_OPCODE_GET_PROC_NAME_BY_PID, (uint64_t)pid, (uint64_t)(uint32_t)name);
+
+// Load module into process: path is string in calling process memory
+system_call_6(8, 0x7777, PS3MAPI_OPCODE_LOAD_PROC_MODULE, (uint64_t)pid, (uint64_t)(uint32_t)path, (uint64_t)(uint32_t)arg, (uint64_t)arg_size);
+```
+
+PS3MAPI opcodes:
+- `PS3MAPI_OPCODE_GET_ALL_PROC_PID` = 0x0021
+- `PS3MAPI_OPCODE_GET_PROC_NAME_BY_PID` = 0x0022
+- `PS3MAPI_OPCODE_LOAD_PROC_MODULE` = 0x0044
+
+### Approach priority for fixing game input
+
+1. ~~Fix capability flags (0xFFFF → 0x1F)~~ — tested, no effect on GTA V
+2. ~~Fix addr=5 parameter in syscall 574~~ — tested addr=0, breaks LDD entirely. addr=5 is required.
+3. ~~Fix data.len and button[1] default~~ — tested len=64 and button[1]=0xFF, no effect on GTA V
+4. **Build xpad_game.sprx** — second SPRX loaded into game process via PS3MAPI Cobra syscall 8. Implemented 2026-07-10: VSH module auto-detects game processes every ~2.5s and loads xpad_game.sprx into them. Game module registers LDD from game context via `cellPadDbgLddRegisterController` syscall 574. **BLOCKED**: PS3MAPI syscall 8 with opcode 0x7777 causes kernel panic on this CFW.
+5. **LV2 kernel write** — find alternative lv2_poke mechanism (syscall 6, 9, 10, 15) not going through PS3MAPI. Use to modify kernel's `device_type` from 5→0 for LDD controllers.
+6. **Compatibility mode** — hooks in game process, requires DEX + debug EBOOT (last resort)
+
+### PS3MAPI auto-loading implementation (2026-07-10)
+
+The VSH module (`main.c`) now includes `check_and_load_game_module()` which:
+1. Gets all process PIDs via `sys8_ps3mapi(PS3MAPI_OPCODE_GET_ALL_PROC_PID, ...)`
+2. For each PID, gets its name via `sys8_ps3mapi(PS3MAPI_OPCODE_GET_PROC_NAME_BY_PID, ...)`
+3. Skips system processes (`vsh`, `VSH`, `sys_` prefixes)
+4. Loads `xpad_game.sprx` via `sys8_ps3mapi(PS3MAPI_OPCODE_LOAD_PROC_MODULE, ...)`
+5. Tracks loaded PIDs in `loaded_pids[]` array to avoid re-loading
+6. Called from `xpadd_thread` every 256 iterations (~2.5s)
+
+PS3MAPI syscall requires Cobra/CFW with syscall 8 enabled. EvilNat 4.90 has this.
+
+**CRASH CONFIRMED (2026-07-10):** Any PS3MAPI sub-opcode (0x0021, 0x0022, 0x0044) via syscall 8 with 0x7777 causes LV2 kernel panic on this EvilNat 4.90 setup. "Cobra syscall 8 enabled" only means the syscall 8 handler exists — PS3MAPI within it may be separately blocked or need `ps3mapi_enable_access_syscall8(key)`. The key is unknown. DO NOT attempt PS3MAPI calls from VSH without a working access mechanism.
+
+**Alternative:** EvilNat 4.90 has "Opcode to create CFW Syscalls (6, 7, 8, 9, 10, 11, 15, 35)". On old PL3-based CFWs, syscall 16 = peek, syscall 20 = poke. On this setup, syscall 7 = lv2_peek (works). Need to find working lv2_poke (try syscall 6, 9, 10, 15, or 20).
+
+Keywords: xpad_game.sprx built with `-zgenprx -zgenstub` (auto-generates import stubs), linked with `libio_stub.a` and `libc.ppu.o` (for memset).
+
+## Session log: 2026-07-10 (part 2 — after GTA V diagnosis)
+
+### CFW syscall map discovery (from webMAN-MOD `peek_poke.h` source)
+
+```c
+// System call 6 - peek (PS3HEN only)
+// System call 7 - poke (PS3HEN only)
+// System call 8 - lv1 peek (CFW: peek LV1/LV2 memory via LV1 hypervisor)
+// System call 9 - lv1 poke (CFW: write LV1/LV2 memory via LV1 hypervisor)
+// System call 11 - lv1 peek (Cobra alternate, same as syscall 8)
+```
+
+Key insight from `peek_poke.c` in webMAN-MOD:
+- LV2 access on CFW goes through **LV1 hypervisor**, not directly
+- `lv1_peekd(addr + 0x8000000ULL)` — LV1 offset for LV2 memory
+- Cobra syscall 8 wraps: `syscall 8(addr)` → hypervisor call
+- Cobra syscall 9 wraps: `syscall 9(addr, value)` → hypervisor call
+- **Syscall 6/7 are NOT for CFW** — they're PS3HEN-only (different HW)
+
+### LV2_OFFSET_ON_LV1 crash (2026-07-10)
+
+- On 4.76+ CFW, `LV2_OFFSET_ON_LV1 = 0x8000000` (from webMAN-MOD `peek_poke.h`)
+- **This offset is WRONG for 4.90 EvilNat** (kernel ported from 4.84 DEX)
+- Passing wrong LV2 offset to syscall 8 causes hypervisor to map invalid memory → **hypervisor fault**
+- Hypervisor fault = unrecoverable: PS3 hangs at boot animation, power button unresponsive
+- PS3 currently crashed, requires safe mode recovery (hold power → second beep → Restore PS3 System / Rebuild File System)
+- **Do NOT test syscall 8/9 from VSH plugin without confirmed correct LV2_OFFSET_ON_LV1 for 4.90 EvilNat**
+
+### PS3MAPI crash root cause (from Cobra 8.4 stage2 source analysis)
+
+Cobra 8.4 stage2 (`src/sys8.c`):
+```c
+static int ps3mapi_partial_disable_syscall8 = 0;
+// 0 = normal operation
+// 1 = disable code injection / process ops
+// 2 = disable all except enable/disable access
+// 3+ = all PS3MAPI ops return ENOSYS (disabled)
+
+int sys8_ps3mapi_handler(...) {
+    if (ps3mapi_partial_disable_syscall8 >= 3) return ENOSYS;
+    // ... process PS3MAPI opcodes
+}
+```
+
+**webMAN-MOD defaults to DISABLED (`ps3mapi_partial_disable_syscall8 >= 3`)** for PSN safety. The webMAN setup thread sets this:
+
+```c
+// webMAN-MOD: sys8.c or similar setup code
+void setup_ps3mapi_security() {
+    // Default: disable PS3MAPI for PSN safety
+    ps3mapi_partial_disable_syscall8 = 3;  // All ops blocked
+}
+```
+
+When PS3MAPI opcodes return `ENOSYS`, the Cobra payload's path may not clean up properly → **kernel panic**. This explains why:
+- "Cobra syscall 8 enabled" shows as true (syscall 8 handler exists)
+- Our `0x7777` dispatched calls hit the ENOSYS path
+- The Cobra stage2 ENOSYS return path has a bug/uninitialized state → kernel panic
+- Fix: call `ps3mapi_enable_access_syscall8(key)` first, but `ps3mapi_key` is set at compile time in Cobra payload and unknown to us
+
+**`ps3mapi_key` default = 0**, `ps3mapi_access_granted = 1` (from Cobra 8.4 source). Access is granted by default when key is 0. Not the cause of crash.
+
+**webMAN-MOD `peek_poke.h`** also reveals: `DEBUG_MEM` conditional enables HTTP peek/poke LV2 commands via webMAN (`/peek.ps3` and `/poke.ps3`). These require `Debug Settings` → `Memory Access` enabled on CFW. May or may not be available on EvilNat 4.90.
+
+### Updated: Alternative write mechanisms
+
+Corrected CFW syscall map:
+- **syscall 6** = PS3HEN-only LV2 peek (NOT for CFW)
+- **syscall 7** = PS3HEN-only LV2 poke (NOT for CFW)
+- **syscall 8** = LV1 peek (CFW: read LV1/LV2 via hypervisor, addr + LV2_OFFSET_ON_LV1)
+- **syscall 9** = LV1 poke (CFW: write to LV1/LV2 via hypervisor, addr + LV2_OFFSET_ON_LV1, value)
+- **syscall 11** = LV1 peek (Cobra alternate, same as syscall 8)
+- **syscall 15/35** = unknown, possibly PSP emu/other
+
+LV2 memory access formula:
+```c
+// Read 64-bit from LV2 address
+uint64_t lv2_read64(uint64_t lv2_addr) {
+    return syscall_1(8, lv2_addr + LV2_OFFSET_ON_LV1);
+}
+
+// Write 64-bit to LV2 address
+void lv2_write64(uint64_t lv2_addr, uint64_t value) {
+    syscall_2(9, lv2_addr + LV2_OFFSET_ON_LV1, value);
+}
+```
+
+**CRITICAL: LV2_OFFSET_ON_LV1 must be correct for the specific CFW version, or hypervisor fault = unrecoverable crash.** Known values:
+- 4.76+: `0x8000000`
+- 4.84 DEX (EvilNat 4.90 base): **UNKNOWN** — likely different, possibly `0x10000000` or region-specific
+- Finding correct offset: dump a known LV2 value (e.g., syscall table entry) via USB ICD or read LV1 mapping table
+
+### Updated: Current blocker
+
+PS3 is currently **crashed** — powered off after hypervisor fault from wrong LV2 offset test. Will not boot past animation. Needs safe mode recovery via console front panel.
+
+### Safe mode recovery procedure
+
+1. Turn PS3 off completely (hold power button until beep → power off)
+2. Hold power button until second beep (~5 seconds) → Safe Mode menu
+3. Options:
+   - Option 3: Restore File System (non-destructive, fixes file system errors)
+   - Option 4: Rebuild Database (non-destructive, may remove webMAN plugin cache)
+   - Option 6: Restore PS3 System (factory reset — DESTRUCTIVE, last resort)
+4. Try Options 3 and 4 first before Option 6
+5. After recovery, clear plugin cache: `rm /dev_hdd0/tmp/*.sprx` via FTP
+6. Check `boot_plugins.txt` for safe boot entries
+
+### What would have caused the crash
+
+The hypervisor (LV1) maps LV2 memory at an offset that differs per CFW version. `0x8000000` is the offset for 4.76+ retail CFW. EvilNat 4.90 uses a kernel ported from 4.84 DEX, which likely has a different LV2→LV1 mapping. Passing an unmapped address to `lv1_peekd` raises an exception in the hypervisor that CFW syscall 8 cannot handle → system lockup.
+
+### Key learning: no syscall 8/9 test from VSH plugin
+
+Never test syscall 8/9 from within a VSH plugin running on the target PS3. A wrong LV2 offset = hypervisor fault = permanently frozen console requiring hard power cycle + safe mode recovery. Test LV1/LV2 access from a minimal standalone self-contained test payload first (loaded fresh each boot, no persistence).
